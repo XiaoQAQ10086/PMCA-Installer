@@ -40,7 +40,7 @@
 use std::time::{Duration, Instant};
 
 use sony_gui::app::{App, FontStatus, Message, Stage};
-use sony_gui::fonts::Fonts;
+use sony_gui::fonts::{self, Fonts};
 
 /// 整个安装最多等多久
 const TIMEOUT: Duration = Duration::from_secs(180);
@@ -55,7 +55,7 @@ fn gui_install_flow_end_to_end() {
     };
 
     // ---- 1. 建一个界面状态（和真启动时一样）----
-    let mut app = App::new(Fonts::fallback(), FontStatus::Missing);
+    let mut app = App::new(Fonts::from_family(fonts::Fonts::default_family()), FontStatus::UiOnly);
     assert!(!app.has_apk(), "刚建好时不该有应用包");
 
     // ---- 2. 相当于"用户选好了 APK" ----
@@ -113,7 +113,7 @@ fn gui_install_flow_end_to_end() {
 /// 这个不需要相机，所以**不标 ignore**，每次跑测试都会执行。
 #[test]
 fn start_without_apk_does_nothing() {
-    let mut app = App::new(Fonts::fallback(), FontStatus::Missing);
+    let mut app = App::new(Fonts::from_family(fonts::Fonts::default_family()), FontStatus::UiOnly);
     app.update(Message::Start);
     assert_eq!(app.stage(), Stage::Idle);
     assert!(app.log_lines().count() >= 1, "至少该有一条字体状态日志");

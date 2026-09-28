@@ -24,7 +24,7 @@ use std::path::PathBuf;
 use iced::window;
 use iced::Size;
 
-use sony_gui::app::{App, FontStatus, Message};
+use sony_gui::app::{App, Message};
 use sony_gui::fonts::{self, Fonts};
 use sony_gui::theme;
 
@@ -38,22 +38,17 @@ fn main() -> iced::Result {
         return Ok(());
     }
 
-    // ---- 找一个系统中文字体 ----
-    // 找不到也照常启动，只是中文会变成方框，界面上会有提示。
-    let (font_bytes, fonts, font_status) = if let Some(f) = fonts::load_system_cjk() {
-        let status = FontStatus::Loaded {
-            name: f.family,
-            path: f.path,
-        };
-        (Some(f.bytes), Fonts::from_family(f.family), status)
-    } else {
-        (None, Fonts::fallback(), FontStatus::Missing)
-    };
+    // ---- 准备字体：内嵌的界面字体 + （如果有）系统字体 ----
+    // 界面文字永远用内嵌的那份，所以**不管系统有没有中文字体，界面都能正常显示**。
+    let font_setup = fonts::setup();
+    let ui_fonts = font_setup.ui;
+    let font_status = font_setup.status;
+    let font_blobs = font_setup.blobs;
 
     let apk_for_boot = initial_apk.clone();
     let mut application = iced::application(
         move || {
-            let mut a = App::new(fonts, font_status);
+            let mut a = App::new(ui_fonts, font_status);
             if let Some(p) = apk_for_boot.clone() {
                 a.set_initial_apk(p);
             }
@@ -69,7 +64,7 @@ fn main() -> iced::Result {
     //    而 iced 要求"对任意生命周期都成立"，于是报
     //    "implementation of FnOnce is not general enough"。
     .theme(|_: &App| theme::theme())
-    .default_font(fonts.regular)
+    .default_font(fonts::font_of(Fonts::default_family()))
     .window(window::Settings {
         size: Size::new(760.0, 660.0),
         min_size: Some(Size::new(620.0, 520.0)),
@@ -92,8 +87,9 @@ fn main() -> iced::Result {
     })
     .antialiasing(true);
 
-    if let Some(bytes) = font_bytes {
-        application = application.font(bytes);
+    // 两个字体都装上：内嵌的界面字体 + 系统字体（用于文件名里的生僻字）
+    for blob in font_blobs {
+        application = application.font(blob);
     }
 
     application.run()

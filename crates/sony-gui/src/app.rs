@@ -69,17 +69,9 @@ pub enum Level {
     Bad,
 }
 
-/// 启动时中文字体的状态
-#[derive(Debug, Clone, Copy)]
-pub enum FontStatus {
-    /// 成功加载（附字体名和路径，会写进日志便于排查）
-    Loaded {
-        name: &'static str,
-        path: &'static str,
-    },
-    /// 没找到
-    Missing,
-}
+// 字体状态定义在 `fonts` 模块里（那边才知道内嵌/系统两层的细节），
+// 这里只是转出去，免得调用方要去两个地方找。
+pub use crate::fonts::FontStatus;
 
 pub struct App {
     pub fonts: Fonts,
@@ -132,11 +124,24 @@ impl App {
             font_status,
         };
         match font_status {
-            FontStatus::Loaded { name, path } => {
-                app.push_log(Level::Info, format!("中文字体：{name}（{path}）"));
+            FontStatus::Full {
+                system_name,
+                system_path,
+            } => {
+                app.push_log(
+                    Level::Info,
+                    format!("界面字体：已内嵌；系统字体：{system_name}（{system_path}）"),
+                );
             }
-            FontStatus::Missing => {
-                app.push_log(Level::Warn, "没有找到系统中文字体，界面中文可能显示为方框");
+            FontStatus::UiOnly => {
+                app.push_log(
+                    Level::Info,
+                    "界面字体：已内嵌（界面显示不受影响）",
+                );
+                app.push_log(
+                    Level::Warn,
+                    "没有找到系统中文字体：文件名里的生僻字可能显示为方框",
+                );
             }
         }
         app
@@ -447,12 +452,12 @@ impl App {
         ]
         .spacing(2);
 
-        if matches!(self.font_status, FontStatus::Missing) {
+        if matches!(self.font_status, FontStatus::UiOnly) {
             col = col.push(banner(
                 self.fonts,
                 th::banner_warning,
                 th::WARNING,
-                "没有找到系统中文字体（微软雅黑 / 黑体 / 等线），界面中文可能显示为方框。",
+                "系统里没有中文字体。界面显示不受影响，但文件名里的生僻字可能显示为方框。",
             ));
         }
         col.into()
@@ -783,7 +788,7 @@ mod tests {
     use sony_install::InstallOutcome;
 
     fn app() -> App {
-        App::new(Fonts::fallback(), FontStatus::Missing)
+        App::new(Fonts::from_family("x"), FontStatus::UiOnly)
     }
 
     #[test]
