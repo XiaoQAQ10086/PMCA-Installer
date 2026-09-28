@@ -80,8 +80,8 @@ impl MarketServer {
     /// - 安装指令里的 SPK 地址：相机拿它去下载应用包。
     ///   原项目用**自己服务的地址** `https://127.0.0.1/`
     ///
-    /// 我一开始两处都用了门户地址 —— 虽然因为所有 TLS 都经 USB 交给我们、
-    /// 主机名其实被忽略（原项目注释：`# Ignoring message.host`），
+    /// 虽然所有 TLS 都经 USB 交给我们、主机名实际上被忽略
+    /// （原项目注释：`# Ignoring message.host`），两处用同一个地址也能跑通，
     /// 但既然原项目分开了，就照抄，少一个未知数。
     pub fn new(apk: Vec<u8>, portal_url: impl Into<String>) -> Result<Self> {
         let packed = spk::dump(&apk)?;
@@ -791,9 +791,10 @@ mod tests {
 
     /// 相机拒绝 start（resultCode 10）时，应**明确失败并提示拔插复位**。
     ///
-    /// 我一开始想自动发 `/task/complete` 替它收尾，但真机上相机回
+    /// 这个状态**只能靠用户拔插相机**，程序清不掉：真机上试过自动发
+    /// `/task/complete` 替它收尾，相机回
     /// `{"message":"Unknown request","resultCode":100}` —— 它不认那条请求。
-    /// 所以这个状态只能靠用户拔插相机，程序清不掉。测试就固定这个行为。
+    /// 测试就固定这个行为。
     #[test]
     fn runner_fails_clearly_when_start_rejected() {
         let mut r = InstallRunner::new(apk(), [1u8; 32]).unwrap();

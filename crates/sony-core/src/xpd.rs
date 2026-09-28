@@ -48,9 +48,10 @@ pub const SECTION_NAME: &str = "DrmTCD";
 /// 这是个 **Python bytes 字面量**，内容是 90 个 ASCII 字符（`'8'`、`'5'`、`'9'`…），
 /// **不是**把这段十六进制解码出来的 45 字节二进制！
 ///
-/// 我最初把它当成十六进制解码成 45 字节，结果相机回复
+/// 把它**当成十六进制去解码**（得到 45 字节二进制）是错的：
+/// 相机收到这样的 CIC 会回
 /// `{"message":"CIC hash mismatch","resultCode":300}`，安装被拒。
-/// 用 ASCII 字符串当密钥后就能通过。
+/// 必须直接用这 90 个 ASCII 字符当密钥。
 ///
 /// 两个密钥算出的校验值完全不同，务必别改。
 pub const CIC_KEY: &str = "8595e68aa50d25dcc52b4d6e6a62af526efd7523a4cc47e212e82e979728d6f0dd02c7e4e79ddb317d56fea2bd";
@@ -171,9 +172,9 @@ pub fn empty_json_response() -> Vec<u8> {
 /// - 默认分隔符是 `(', ', ': ')`，**冒号和逗号后各有一个空格**
 /// - **键的顺序是插入顺序**：`command`、`args`、`attrs`
 ///
-/// 我一开始用 `serde_json::json!` + `to_vec`，结果：
-/// 1. 输出是紧凑格式（无空格）
-/// 2. 而且 `serde_json::Value` 内部用 `BTreeMap`，**把键按字母序重排**了
+/// ⚠️ 不能图省事用 `serde_json::json!` + `to_vec`，有两个差异：
+/// 1. 它输出紧凑格式（没有空格）
+/// 2. `serde_json::Value` 内部用 `BTreeMap`，会**把键按字母序重排**
 ///    → `{"args":…, "attrs":…, "command":…}`
 ///
 /// 虽然任何正常的 JSON 解析器都不该在意顺序和空白，但既然原项目产出是确定的

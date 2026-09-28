@@ -134,9 +134,9 @@ impl HttpResponse {
     /// \r\n
     /// ```
     ///
-    /// 我一开始为了"简单"改成了 `Connection: close`，而且没有 Server/Date。
-    /// 真机上相机收到我们的安装指令后**没有去下载应用包**，直接关闭了连接 ——
-    /// 这些差异就是最可疑的地方，所以逐项照抄。
+    /// ⚠️ 这几个头**都要照抄**。真机上出现过"相机收到安装指令后没有去
+    /// 下载应用包、直接关闭连接"，而当时唯一的差异就是这里用了
+    /// `Connection: close`、并且缺了 Server/Date。
     pub fn encode(&self) -> Vec<u8> {
         let mut head = format!("HTTP/1.0 {} {}\r\n", self.status, reason(self.status));
         // Python 的 send_response() 会先补这两条

@@ -195,9 +195,9 @@ impl RecordCipher {
         //   `14 00 00 0c` + 12 字节校验值 + 20 字节 MAC + 12 个 `0x0b`
         //   16(明文) + 20(MAC) + 11(填充) + 1(长度字节) = 48 ✅
         //
-        // 我最初按 PKCS#7 的习惯只剥 `padding_length` 个字节，
-        // 把那个长度字节留在了明文里，导致 MAC 永远校验不过 ——
-        // 而且现象很迷惑：明文头部完全正确，只有最后多一个字节。
+        // ⚠️ 这里容易按 PKCS#7 的习惯只剥 `padding_length` 个字节 —— 那就错了：
+        // 那个长度字节会留在明文里，导致 MAC 永远校验不过。
+        // 而且现象很迷惑：明文头部完全正确，只有最后多出一个字节。
         let pad_byte = *buf.last().ok_or(RecordError::BadPadding)? as usize;
         let total_pad = pad_byte + 1;
         if total_pad > buf.len() {

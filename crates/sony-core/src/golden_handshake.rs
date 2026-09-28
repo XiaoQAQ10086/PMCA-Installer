@@ -133,7 +133,7 @@ mod tests {
 
     /// 用录到的服务端随机数重建 ServerHello，必须与录音逐字节一致。
     ///
-    /// 这验证了 M1 的构造逻辑，包括两个我一开始猜错、被真机数据纠正的地方：
+    /// 这验证了服务端问候语的构造逻辑，包括两个**不能靠猜**的细节：
     /// - 服务端选的是 **AES-256**（0x0035），不是 AES-128
     /// - 服务端回了一个 **安全重协商扩展**（ff 01 00 01 00）
     #[test]
@@ -242,8 +242,8 @@ mod tests {
 
         // 转录 = **双方来往的全部握手消息**，按顺序：
         //   ClientHello ‖ ServerHello ‖ Certificate ‖ ServerHelloDone ‖ ClientKeyExchange
-        // ⚠️ 少一条都不行 —— 我一开始只放了 ClientHello 和 ClientKeyExchange，
-        //    漏掉服务端那三条，校验值自然对不上。
+        // ⚠️ 少一条都不行 —— 比如只放 ClientHello 和 ClientKeyExchange、
+        //    漏掉服务端那三条，校验值就对不上。
         // ⚠️ 也不含 ChangeCipherSpec：CCS 不是握手消息（RFC 2246）。
         let mut transcript = Vec::new();
         transcript.extend_from_slice(&g.client_hello);

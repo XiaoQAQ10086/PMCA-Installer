@@ -9,6 +9,17 @@ install-diag.log
 # 临时文件
 *.broken
 *.tmp
+*.tmp.md
 
 # 打包出来的安装包
 *.spk
+
+# 本机的 cargo 配置（镜像源等）—— 只对当前机器有意义，
+# 传上去会强制别人也用同一个镜像，所以不入库
+/.cargo/config.toml
+
+# 编辑器 / 系统产生的杂物
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

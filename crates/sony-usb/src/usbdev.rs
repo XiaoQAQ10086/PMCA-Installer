@@ -39,10 +39,8 @@ use windows_sys::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, HWND};
 ///
 /// # 为什么按枚举器找，而不是按设备类找
 ///
-/// 我一开始按设备类 `GUID_DEVCLASS_USB` 找，结果**一台都找不到**
-/// （真机上验证过 —— 相机明明插着，枚举结果是空的）。
-///
-/// 原因是：相机在 WPD 模式下，设备节点虽然叫
+/// ⚠️ 按设备类 `GUID_DEVCLASS_USB` 找会**一台都找不到**：
+/// 相机在 WPD 模式下，设备节点虽然叫
 /// `USB\VID_054C&PID_077A\...`，但它的**安装类是「WPD」而不是「USB」**，
 /// 按 USB 类去问自然问不到。
 ///

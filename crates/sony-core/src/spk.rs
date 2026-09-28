@@ -46,11 +46,10 @@ pub const MIME_TYPE: &str = "application/vnd.sony.spk.package-archive";
 /// `sampleSpkKey` 密文做原始 RSA 解密（`pow(blob, 65537, n)`），
 /// 得到一个 256 字节的值，其**最高 240 字节为零**，真正的密钥是**最低 16 字节**。
 ///
-/// ⚠️ 这里踩过一个坑：我最初用 PowerShell 的 `BigInteger` 复算时，
-/// 误把这个 256 字节结果的**第 12..27 字节**当成了密钥，得到
-/// `8c6d0be5…` 这个**错误值**，还一度写进了设计文档。
-/// 后来用 Python 独立复算（`pow` 与 pycryptodome 两条路径）才确认真值是下面这个，
-/// 并已通过"与独立 Python 实现的 SPK 输出逐字节一致"验证。
+/// ⚠️ 取密钥时**只取最低 16 字节**，别取错位置。
+/// 一个容易犯的错误是把这 256 字节结果的**第 12..27 字节**当成密钥
+/// （会得到 `8c6d0be5…` 这个错误值，且能通过不少自检）。
+/// 下面这个值已通过"与独立 Python 实现的 SPK 输出逐字节一致"验证。
 pub const FIXED_AES_KEY: [u8; 16] = [
     0xc3, 0x01, 0xaf, 0xd2, 0x2d, 0xdb, 0xa4, 0xc0, 0x90, 0xec, 0xa4, 0x62, 0x58, 0xe4, 0xbf, 0xb1,
 ];

@@ -41,13 +41,14 @@
 #include <string.h>
 
 /*
- * ⚠️ 踩坑记录：`PortableDeviceApi.h` 里对 `IPortableDeviceValues` 等接口
+ * ⚠️ `PortableDeviceApi.h` 里对 `IPortableDeviceValues` 等接口
  * **只有前向声明**，完整定义在 `PortableDeviceTypes.h`。
- * 如果漏掉后者，编译器看到的是不完整类型，`params->lpVtbl->SetGuidValue(params, ...)` 会报
+ * 漏掉后者的话，编译器看到的是不完整类型，
+ * `params->lpVtbl->SetGuidValue(params, ...)` 会报
  * "不是 IPortableDeviceValues 的成员"。
  *
- * 这个坑也正是我在 Rust 侧手写绑定时踩到的：vtable 布局本身没错，
- * 是我参照的定义不完整。用 C 之后编译器会直接把这个错误指出来。
+ * 这也是选用 C 做这一层的原因：手写绑定时 vtable 布局本身没错，
+ * 只是参照的接口定义不完整，而这类错误在 C 里编译器会直接指出来。
  */
 
 /* ------------------------------------------------------------------ */
