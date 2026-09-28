@@ -212,19 +212,17 @@ pub fn describe_present_but_not_wpd(ids: &[UsbId]) -> String {
         );
     }
 
-    format!(
-        "检测到了索尼 USB 设备，但它没有以「便携设备（MTP）」的形式出现。\n\
-         设备：{detail}\n\
-         \n\
-         最常见的原因是相机菜单里的 **USB 连接方式设成了「海量存储器」**。\n\
-         海量存储器模式下，相机在 Windows 里就是个 U 盘，装应用用的通道根本不存在。\n\
-         \n\
-         改法（在相机上操作，只需改一次）：\n\
-         菜单 → 设置 → USB → USB 连接 → 改成「MTP」或「自动」\n\
-         改完把 USB 线拔下再插上，然后重试。\n\
-         \n\
-         （设成「电脑遥控」也一样装不了，改成 MTP 即可。）"
-    )
+    // 只说该怎么做，不解释原理 —— 用户要的是"我该按哪里"，
+    // 不是"为什么海量存储器不行"。
+    // 设备号这类排查用的信息交给诊断日志，不占提示的位置。
+    let _ = detail;
+    "请把相机的 USB 连接方式改成「MTP」。\n\
+     \n\
+     做法（在相机上改一次就行）：\n\
+     菜单 → 设置 → USB → USB 连接 → 选「MTP」（有「自动」也可以）\n\
+     \n\
+     改完把 USB 线拔下来再插上，然后重新点「开始安装」。"
+        .to_string()
 }
 
 #[cfg(test)]
@@ -256,17 +254,21 @@ mod tests {
     }
 
     /// 设备是"未知 PID"（也就是非 MTP 模式，典型就是海量存储器）
-    /// → 提示应该指向相机菜单里的 USB 设置
+    /// → 提示只需要教用户**怎么改成 MTP**，不用解释原理
     #[test]
-    fn unknown_pid_points_at_camera_usb_setting() {
+    fn unknown_pid_just_tells_how_to_switch_to_mtp() {
         let msg = describe_present_but_not_wpd(&[UsbId {
             vendor: 0x054C,
             product: 0x0AAA, // 编一个：既不是 MTP 也不是应用安装模式
         }]);
-        assert!(msg.contains("海量存储器"), "要说清楚是这个原因：{msg}");
-        assert!(msg.contains("054C:0AAA"), "要列出实际看到的设备");
-        assert!(msg.contains("MTP"), "要给出改法");
-        assert!(msg.contains("菜单"), "要说明是去相机菜单里改");
+        // 要教清楚怎么改
+        assert!(msg.contains("MTP"), "必须给出改法：{msg}");
+        assert!(msg.contains("菜单"), "要说清楚是在相机菜单里改");
+        assert!(msg.contains("USB"), "要指明是 USB 连接这一项");
+        // 不要解释原理，也不要露设备号 —— 用户要的是"按哪里"
+        assert!(!msg.contains("海量存储器"), "不用解释为什么不行：{msg}");
+        assert!(!msg.contains("0AAA"), "不该把设备号摆给用户看：{msg}");
+        assert!(!msg.contains("U 盘"), "不用解释原理：{msg}");
     }
 
     /// 设备**本来就是 MTP 模式**却没被 WPD 列出来

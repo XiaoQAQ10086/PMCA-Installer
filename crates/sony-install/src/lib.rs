@@ -41,6 +41,13 @@ const MAX_HANDSHAKE_ATTEMPTS: u32 = 6;
 /// 每次重试之间等多久（相机重新枚举后需要一点时间稳定）
 const HANDSHAKE_RETRY_DELAY: Duration = Duration::from_millis(700);
 
+/// 等相机切换到「应用安装模式」最多等多久。
+///
+/// 这个值会**出现在给用户看的提示里**（"等待 N 秒"），
+/// 所以提示语里用的是 `MODE_SWITCH_TIMEOUT.as_secs()` 而不是写死的数字 ——
+/// 以后改这个常量，提示会自动跟着变，不会对不上。
+const MODE_SWITCH_TIMEOUT: Duration = Duration::from_secs(25);
+
 /// 相机当前状态
 #[derive(Debug, Clone)]
 pub struct CameraStatus {
@@ -110,6 +117,15 @@ fn no_camera_found() -> anyhow::Error {
              ③ 没有别的程序占用相机（照片应用、资源管理器预览、原版 PMCA 等）"
         )
     } else {
+        // 提示语里只留"该怎么做"，设备号这类排查信息记进诊断日志 ——
+        // 用户不需要看到 054C:0AAA 这种号码，但出问题时我们得能查
+        sony_core::market::trace_diag(&format!(
+            "[设备] WPD 看不到相机，但从 USB 枚举到的索尼设备：{}",
+            ids.iter()
+                .map(|i| format!("{:04X}:{:04X}", i.vendor, i.product))
+                .collect::<Vec<_>>()
+                .join("、")
+        ));
         anyhow::anyhow!("{}", sony_usb::usbdev::describe_present_but_not_wpd(&ids))
     }
 }
@@ -265,7 +281,7 @@ pub fn find_and_prepare_camera(report: Reporter) -> Result<CameraStatus> {
     // - 压根没重新枚举         → 相机不理这条命令，多半是**不支持装应用**
     let old_pnp_id = dev.pnp_id.clone();
     let mut re_enumerated = false;
-    let deadline = Instant::now() + Duration::from_secs(25);
+    let deadline = Instant::now() + MODE_SWITCH_TIMEOUT;
     while Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(500));
         let devices = match sony_usb::list_sony_devices() {
@@ -303,11 +319,12 @@ pub fn find_and_prepare_camera(report: Reporter) -> Result<CameraStatus> {
         );
     }
     anyhow::bail!(
-        "相机没有响应「切换到应用安装模式」的命令（等了 25 秒）。\n\
+        "相机没有响应「切换到应用安装模式」的命令（等待 {} 秒）。\n\
          这通常说明**这台相机不支持安装应用**。\n\
          相机型号：{}\n\
          能装应用的机型需要支持 PlayMemories Camera Apps。\n\
          如果你的相机确实支持，请把 USB 线拔下再插上后重试。",
+        MODE_SWITCH_TIMEOUT.as_secs(),
         info.model
     )
 }

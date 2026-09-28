@@ -445,7 +445,7 @@ impl App {
                 .size(th::SIZE_TITLE)
                 .font(self.fonts.bold)
                 .color(th::TEXT),
-            text("把 Android 应用装到索尼相机上 · 全自动识别相机")
+            text("把 Android 应用装到索尼相机上 · 自动识别相机")
                 .size(th::SIZE_CAPTION)
                 .font(self.fonts.regular)
                 .color(th::TEXT_WEAK),
@@ -476,7 +476,7 @@ impl App {
                     th::WARNING
                 },
                 format!("{}  {}", s.model, s.mode_text()),
-                format!("序列号 {}　·　安装时会自动切换到应用安装模式", s.serial),
+                format!("序列号 {} · 安装时自动切换到应用安装模式", s.serial),
             ),
         };
 
@@ -694,15 +694,9 @@ impl App {
             "④ 运行日志",
             self.fonts,
             column![
-                row![
-                    text("安装过程的详细信息都在这里，出问题时可以对照排查")
-                        .size(th::SIZE_CAPTION)
-                        .font(self.fonts.regular)
-                        .color(th::TEXT_FAINT)
-                        .width(Length::Fill),
-                    clear,
-                ]
-                .align_y(Alignment::Center),
+                // 说明文字按用户要求去掉了，只留右下角的「清空」按钮。
+                // 用 space 把按钮顶到右边，保持原来的位置。
+                row![space::horizontal(), clear].align_y(Alignment::Center),
                 area,
             ]
             .spacing(6)
