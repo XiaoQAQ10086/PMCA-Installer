@@ -51,6 +51,7 @@ dependencies = [
  "anyhow",
  "rsa",
  "sony-core",
+ "sony-install",
  "sony-usb",
  "tracing",
  "tracing-subscriber",

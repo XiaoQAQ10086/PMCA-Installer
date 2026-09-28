@@ -42,7 +42,7 @@ fn main() -> iced::Result {
     let mut application = iced::application(
         move || {
             let mut a = App::new(fonts, font_status);
-            let _ = a.boot_task();
+            a.boot_task();
             a
         },
         App::update,

@@ -35,6 +35,12 @@ const PROXY_OPS: [u16; 4] = [0x9488, 0x9489, 0x948C, 0x948D];
 /// 卡住时用户看到的应该是明确的错误，而不是转不完的圈。
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// 打开相机 + 握手最多试几次
+const MAX_HANDSHAKE_ATTEMPTS: u32 = 6;
+
+/// 每次重试之间等多久（相机重新枚举后需要一点时间稳定）
+const HANDSHAKE_RETRY_DELAY: Duration = Duration::from_millis(700);
+
 /// 相机当前状态
 #[derive(Debug, Clone)]
 pub struct CameraStatus {
@@ -186,6 +192,9 @@ pub fn find_and_prepare_camera(report: Reporter) -> Result<CameraStatus> {
         {
             dev = d;
             step(report, "切换成功");
+            // 刚重新枚举出来的设备还需要一点点时间才稳定，
+            // 否则紧接着开会话可能拿到 0x8007001F
+            std::thread::sleep(Duration::from_millis(600));
             return Ok(CameraStatus {
                 pnp_id: dev.pnp_id,
                 model: info.model,
@@ -246,11 +255,40 @@ pub fn install(apk: &[u8], app_name: &str, report: Reporter) -> Result<InstallOu
     ));
 
     // ② 打开并握手
+    //
+    // ⚠️ 这里**必须能重试**：相机刚切换完模式、USB 连接刚刚重新枚举出来，
+    //    有时候还没完全就绪就开会话，会拿到
+    //    `0x8007001F（连到系统上的设备没有发挥作用）`。
+    //    这不是真故障，等几百毫秒再来一次就好。
+    //    没有重试的话，用户看到的就是"刚点安装就报错"，体验很差。
     step(report, "正在打开相机并建立会话…");
-    let transport = sony_usb::WpdTransport::open(&status.pnp_id).context("打开相机失败")?;
-    let mut session = sony::SonySession::new(transport, RetryPolicy::default());
-    let protocols = session.handshake().context("与相机握手失败")?;
-    let _ = protocols;
+    let mut attempt = 0;
+    let (mut session, _protocols) = loop {
+        attempt += 1;
+        match sony_usb::WpdTransport::open(&status.pnp_id) {
+            Ok(transport) => {
+                let mut s = sony::SonySession::new(transport, RetryPolicy::default());
+                match s.handshake() {
+                    Ok(p) => break (s, p),
+                    Err(e) if attempt < MAX_HANDSHAKE_ATTEMPTS => {
+                        sony_core::market::trace_diag(&format!(
+                            "[握手] 第 {attempt} 次失败：{e}，稍后重试"
+                        ));
+                        step(report, format!("相机还没准备好，正在重试（第 {attempt} 次）…"));
+                    }
+                    Err(e) => return Err(e).context("与相机握手失败"),
+                }
+            }
+            Err(e) if attempt < MAX_HANDSHAKE_ATTEMPTS => {
+                sony_core::market::trace_diag(&format!(
+                    "[握手] 第 {attempt} 次打开失败：{e}，稍后重试"
+                ));
+                step(report, format!("相机还没准备好，正在重试（第 {attempt} 次）…"));
+            }
+            Err(e) => return Err(e).context("打开相机失败"),
+        }
+        std::thread::sleep(HANDSHAKE_RETRY_DELAY);
+    };
 
     // ③ 编排器负责"该发什么、收到什么怎么答"
     let mut runner = InstallRunner::new(apk.to_vec(), rand_server_random())?;
@@ -300,8 +338,13 @@ pub fn install(apk: &[u8], app_name: &str, report: Reporter) -> Result<InstallOu
         }
 
         // 进度
+        //
+        // 注意：编排器在收尾时会报一次"安装完成"，但那不是真正的进度值
+        // （解析不出百分比）。所以**正在收尾时不再往外报**，
+        // 由下面 Done 分支统一报一次 100%，避免出现"完成（0%）"这种误导数字。
+        let finishing = matches!(runner.phase(), InstallPhase::Done | InstallPhase::Failed);
         let text = runner.progress_text();
-        if text != last_text {
+        if text != last_text && !finishing {
             sony_core::market::trace_diag(&format!("[进度] {text}"));
             report(Event::Progress {
                 percent: percent_from_text(&text),

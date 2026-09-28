@@ -45,247 +45,37 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// 确保相机处于**应用安装模式**；不在就自动切过去。
-///
-/// 为什么需要这个：相机在重新插拔、休眠、或安装完成后会**复位回普通 MTP 模式**。
-/// 所以每次安装前都要检查一遍，而不是假定它还停在安装模式。
-///
-/// 判定依据是相机支持的操作码：
-/// - 普通 MTP 模式：有 `0x9280/0x9281/0x9282`（索尼扩展命令），没有代理消息操作码
-/// - 应用安装模式：有 `0x9488/0x9489/0x948c/0x948d`（代理消息）
-fn ensure_app_install_mode(dev: &mut sony_usb::WpdDevice) -> Result<()> {
-    use sony_core::mtp;
-    use sony_core::transport::PtpTransport;
-    use std::time::{Duration, Instant};
-
-    const PROXY_OPS: [u16; 4] = [0x9488, 0x9489, 0x948C, 0x948D];
-
-    /// 读一次设备信息，失败时给出可读的原因
-    fn read_info(dev: &sony_usb::WpdDevice) -> Result<mtp::DeviceInfo> {
-        let mut t = sony_usb::WpdTransport::open(&dev.pnp_id).context("打开相机失败")?;
-        let _ = PtpTransport::send_command(&mut t, mtp::PTP_OC_OPEN_SESSION, &[1]);
-        let (rc, data) = PtpTransport::send_read_command(&mut t, mtp::PTP_OC_GET_DEVICE_INFO, &[])?;
-        if rc != mtp::PTP_RC_OK {
-            anyhow::bail!("读设备信息失败：响应码 0x{rc:04x}");
-        }
-        mtp::parse_device_info(&data).context("解析设备信息失败")
-    }
-
-    let info = read_info(dev)?;
-    println!("  相机型号：{}", info.model);
-    if info.supports_all(&PROXY_OPS) {
-        println!("  当前已是应用安装模式 ✅");
-        return Ok(());
-    }
-
-    println!("  当前是普通 MTP 模式，需要先切换");
-    if !info.supports_all(&[mtp::PTP_OC_SONY_DI_EXT_CMD_WRITE, mtp::PTP_OC_SONY_DI_EXT_CMD_READ]) {
-        anyhow::bail!(
-            "这台相机在当前模式下既不支持代理消息、也不支持索尼扩展命令，无法安装应用。\n\
-             支持的操作码：{:?}",
-            info.operations_supported
-                .iter()
-                .map(|c| format!("0x{c:04x}"))
-                .collect::<Vec<_>>()
-        );
-    }
-
-    println!("  正在命令相机切换（相机会重启 USB 连接）…");
-    {
-        let mut t = sony_usb::WpdTransport::open(&dev.pnp_id).context("打开相机失败")?;
-        let _ = PtpTransport::send_command(&mut t, mtp::PTP_OC_OPEN_SESSION, &[1]);
-        // 即使这条命令报错，相机也可能已经切了，所以不直接失败
-        if let Err(e) = PtpTransport::switch_to_app_install_mode(&mut t) {
-            println!("  提示：{e}（相机可能仍会切换，继续等待）");
-        }
-    }
-
-    // 等相机重新枚举成"应用安装模式"
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(500));
-        let Ok(Some(d)) = sony_usb::find_sony_camera() else {
-            continue;
-        };
-        if d.pnp_id == dev.pnp_id {
-            continue; // 还是老设备，还没切完
-        }
-        // 设备换了，确认一下新模式
-        std::thread::sleep(Duration::from_millis(400));
-        if let Ok(info) = read_info(&d)
-            && info.supports_all(&PROXY_OPS)
-        {
-            *dev = d;
-            println!("  切换成功 ✅");
-            return Ok(());
-        }
-    }
-
-    anyhow::bail!(
-        "等待相机切换到应用安装模式超时（20 秒）。\n\
-         请拔插一次 USB 线后重试。"
-    )
-}
-
 /// 把 APK 安装到相机上。
 ///
-/// 这是把前面积累的所有零件串起来的一条完整流程：
-/// 打开相机 → 打招呼 → 发 XPD → 扮演 HTTPS 服务器 → 收结果。
+/// 这里的实现**直接复用 `sony-install`** —— 图形界面点"开始安装"走的是
+/// 同一个函数。两处共用一份逻辑，就不会出现"命令行能装、界面装不了"
+/// 这种两边跑偏的情况。
 fn install_app(apk_path: &str) -> Result<()> {
-    use sony_core::market::{InstallPhase, InstallRunner, check_result};
-    use sony_core::proxy::RetryPolicy;
-    use sony_core::sony;
-    use std::time::{Duration, Instant};
-
     let apk = std::fs::read(apk_path).with_context(|| format!("读取 {apk_path} 失败"))?;
+    let name = std::path::Path::new(apk_path)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| apk_path.to_string());
+
     println!("=== 准备安装 ===");
-    println!("应用包：{}（{} 字节）", apk_path, apk.len());
-    if !apk.starts_with(b"PK") {
-        println!("⚠️  这个文件看起来不是 APK（开头不是 PK）。如果是 zip 压缩的应用包可以继续。");
-    }
-
-    // 诊断落盘：真机每次插拔复位后**只有一次机会**（相机记住未完成的
-    // 任务后会拒绝新的 start），所以关键信息必须写进文件才能回看。
-    let log_path = "install-diag.log";
-    match sony_core::market::diag_init(log_path) {
-        Ok(()) => println!("诊断日志：{log_path}"),
-        Err(e) => println!("（诊断日志 {log_path} 无法写入：{e}）"),
-    }
-
+    println!("应用包：{apk_path}（{} 字节）", apk.len());
     println!();
-    println!("=== 正在查找相机 ===");
-    let mut dev = {
-        let Some(d) = sony_usb::find_sony_camera().context("枚举设备失败")? else {
-            anyhow::bail!(
-                "没有找到索尼相机。\n\
-                 请确认：\n\
-                 1. 相机已开机、USB 线已插好\n\
-                 2. 没有别的程序占用相机"
-            );
-        };
-        d
+
+    let mut report = |ev: sony_install::Event| match ev {
+        sony_install::Event::Step(s) => println!("  {s}"),
+        sony_install::Event::Progress { percent, text } => {
+            println!("  {text}（{percent}%）");
+        }
     };
-    println!("找到：{}", dev.pnp_id);
 
-    // ---- 关键一步：确保相机在应用安装模式 ----
-    // 相机重新插拔/休眠后会复位回普通 MTP 模式，所以每次都要检查。
-    // 普通 MTP 模式与安装模式的区别就在支持的操作码上。
-    println!();
-    println!("=== 检查相机模式 ===");
-    ensure_app_install_mode(&mut dev)?;
-    println!("找到：{}（应用安装模式）", dev.pnp_id);
+    let outcome = sony_install::install(&apk, &name, &mut report)?;
 
     println!();
-    println!("=== 正在打开相机 ===");
-    let transport = sony_usb::WpdTransport::open(&dev.pnp_id).context("打开相机失败")?;
-
-    println!("=== 正在与相机建立会话 ===");
-    let mut session = sony::SonySession::new(transport, RetryPolicy::default());
-    let protocols = session.handshake().context("与相机握手失败")?;
-    println!(
-        "相机支持：{}",
-        protocols
-            .iter()
-            .map(|(n, id)| format!("{}(0x{id:x})", String::from_utf8_lossy(n)))
-            .collect::<Vec<_>>()
-            .join("、")
-    );
-
-    // 编排器负责"该发什么、收到什么怎么答"
-    let mut runner = InstallRunner::new(apk, rand_server_random())?;
-    // 会话已经完成握手了，编排器直接从运行阶段开始
-    runner.mark_hello_done();
-
-    println!();
-    println!("=== 开始安装 ===");
-    let deadline = Instant::now() + Duration::from_secs(120);
-    let mut last_text = String::new();
-
-    loop {
-        if Instant::now() > deadline {
-            sony_core::market::trace_diag("[主循环] 超时，任务未完成");
-            anyhow::bail!(
-                "超时（120 秒）。相机没有完成任务。\n\
-                 详细诊断已写入 {log_path}。"
-            );
-        }
-        if runner.phase() == InstallPhase::Done || runner.phase() == InstallPhase::Failed {
-            break;
-        }
-
-        // ① 把编排器要发的消息发出去
-        for m in runner.take_outgoing() {
-            sony_core::market::trace_diag(&format!("[主循环] 发送消息，外层类型 {}", m.msg_type));
-            session.channel_mut().send(&m)?;
-        }
-
-        // ② 收一条相机的消息（收不到就稍等，NoData 是正常状态）
-        match session.channel_mut().receive() {
-            Ok(Some(msg)) => {
-                sony_core::market::trace_diag(&format!(
-                    "[主循环] 收到消息，外层类型 {}，正文 {} 字节",
-                    msg.msg_type,
-                    msg.payload.len()
-                ));
-                if let Err(e) = runner.poll(msg) {
-                    sony_core::market::trace_diag(&format!("[主循环] 处理消息出错：{e}"));
-                }
-            }
-            Ok(None) => {
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            Err(e) => {
-                sony_core::market::trace_diag(&format!("[主循环] 读取消息出错：{e}"));
-                std::thread::sleep(Duration::from_millis(100));
-            }
-        }
-
-        // ③ 更新进度显示
-        let text = runner.progress_text();
-        if text != last_text {
-            println!("  {text}");
-            last_text = text;
-        }
+    println!("✅ 安装完成");
+    if let Some(r) = outcome.device_report {
+        println!("相机信息：{r}");
     }
-
-    println!();
-    match runner.phase() {
-        InstallPhase::Done => {
-            if let Some(r) = runner.result() {
-                check_result(r)?;
-            }
-            println!("✅ 安装完成");
-            if let Some(info) = runner.device_report() {
-                println!("相机信息：{}", info);
-            }
-            Ok(())
-        }
-        _ => anyhow::bail!(
-            "安装失败：{}",
-            runner.error().unwrap_or("原因未知")
-        ),
-    }
-}
-
-/// 生成一个随机数当服务端随机数。没有相机时用时间戳也够用。
-fn rand_server_random() -> [u8; 32] {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let mut out = [0u8; 32];
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let pid = std::process::id() as u128;
-    let mut seed = nanos ^ (pid << 64);
-    for b in out.iter_mut() {
-        // xorshift，够用了：TLS 的随机数只要求不可预测到"猜不出"，
-        // 而我们这次是本地短连接、不涉及长期密钥。
-        seed ^= seed << 13;
-        seed ^= seed >> 7;
-        seed ^= seed << 17;
-        *b = (seed & 0xFF) as u8;
-    }
-    out
+    Ok(())
 }
 
 /// 命令相机**切换到应用安装模式**，然后等它重新出现。
