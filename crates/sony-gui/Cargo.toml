@@ -6,6 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 description = "索尼相机应用安装器（图形界面）"
 
+[lib]
+name = "sony_gui"
+path = "src/lib.rs"
+
 [[bin]]
 name = "sony-app-installer"
 path = "src/main.rs"

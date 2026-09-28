@@ -84,7 +84,18 @@ fn step(report: Reporter, text: impl Into<String>) {
 
 // ---------------------------------------------------------------- 相机
 
-/// 读一次相机信息（打开会话 + 读设备信息 + 关会话）
+/// 读一次相机信息（打开会话 + 读设备信息）
+///
+/// ⚠️ **这里故意不发 `CLOSE_SESSION`**。
+///
+/// 我一开始"顺手"补了一句 `CloseSession`，结果后面代理消息握手就
+/// 稳定报 `0x8007001F（连到系统上的设备没有发挥作用）`。
+/// 原因有两个可能，都指向"别多此一举"：
+/// 1. MTP 的 `CloseSession` 要带**会话号**作为参数，我传的是空参数 —— 请求是畸形的
+/// 2. 设备对象析构时本来就会收尾，显式关会话反而把相机留在中间状态
+///
+/// 原项目（以及我们验证过能跑通的那条路径）都是**不关**的。
+/// 所以这里保持"打开 → 读 → 让 `WpdTransport` 自己析构"。
 fn read_info(pnp_id: &str) -> Result<sony_core::mtp::DeviceInfo> {
     use sony_core::mtp;
     use sony_core::transport::PtpTransport;
@@ -92,7 +103,6 @@ fn read_info(pnp_id: &str) -> Result<sony_core::mtp::DeviceInfo> {
     let mut t = sony_usb::WpdTransport::open(pnp_id).context("打开相机失败")?;
     let _ = PtpTransport::send_command(&mut t, mtp::PTP_OC_OPEN_SESSION, &[1]);
     let (rc, data) = PtpTransport::send_read_command(&mut t, mtp::PTP_OC_GET_DEVICE_INFO, &[])?;
-    let _ = PtpTransport::send_command(&mut t, mtp::PTP_OC_CLOSE_SESSION, &[]);
     if rc != mtp::PTP_RC_OK {
         anyhow::bail!("读设备信息失败：响应码 0x{rc:04x}");
     }

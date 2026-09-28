@@ -24,7 +24,7 @@
 //! 用定时轮询而不是 `Task::perform`，是因为轮询最简单、也最不容易出错：
 //! 界面永远不会被后台卡住，消息晚几十毫秒到也无所谓。
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, channel};
 
 use sony_install::{CameraStatus, Event, InstallOutcome};
@@ -37,6 +37,18 @@ pub struct ApkChoice {
     pub name: String,
     /// 字节数
     pub size: u64,
+}
+
+impl ApkChoice {
+    /// 从路径构造（文件选择、拖放、命令行参数三条路都走这里）
+    pub fn from_path(path: PathBuf) -> Self {
+        let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        let name = path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        Self { path, name, size }
+    }
 }
 
 /// 让用户挑一个应用包。
@@ -53,24 +65,13 @@ pub fn spawn_pick_apk() -> Receiver<Option<ApkChoice>> {
                 .add_filter("Android 应用包", &["apk"])
                 .add_filter("所有文件", &["*"])
                 .pick_file()
-                .map(|path| {
-                    let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-                    ApkChoice {
-                        name: file_name_of(&path),
-                        path,
-                        size,
-                    }
-                });
+                .map(ApkChoice::from_path);
             let _ = tx.send(picked);
         });
     rx
 }
 
-fn file_name_of(path: &Path) -> String {
-    path.file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.display().to_string())
-}
+
 
 /// 工作线程 → 界面线程的消息
 #[derive(Debug)]

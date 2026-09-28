@@ -110,6 +110,10 @@ pub enum Message {
     Tick,
     /// 清空运行日志
     ClearLog,
+    /// 用户把文件拖进了窗口
+    ApkDropped(std::path::PathBuf),
+    /// 不关心的窗口事件（定位、缩放等），什么都不做
+    Ignored,
 }
 
 impl App {
@@ -141,6 +145,35 @@ impl App {
     /// 启动时立即检测一次相机
     pub fn boot_task(&mut self) {
         self.begin_check();
+    }
+
+    /// 预选一个应用包（命令行参数传进来的）
+    ///
+    /// 这样用户可以直接把 APK 拖到 exe 上，或者用
+    /// `索尼相机应用安装器.exe 某个应用.apk` 打开，省掉一次点击。
+    pub fn set_initial_apk(&mut self, path: std::path::PathBuf) {
+        if !path.exists() {
+            self.push_log(
+                Level::Warn,
+                format!("命令行给的文件不存在，已忽略：{}", path.display()),
+            );
+            return;
+        }
+        self.accept_apk(path);
+    }
+
+    /// 接受一个应用包（文件选择、拖放、命令行参数三条路都走这里）
+    fn accept_apk(&mut self, path: std::path::PathBuf) {
+        let choice = ApkChoice::from_path(path);
+        self.push_log(
+            Level::Info,
+            format!("已选择 {}（{}）", choice.name, human_size(choice.size)),
+        );
+        self.apk = Some(choice);
+        // 换包之后把上一次的安装结果清掉，免得混淆
+        if matches!(self.stage, Stage::Done | Stage::Failed) {
+            self.reset();
+        }
     }
 
     fn push_log(&mut self, level: Level, text: impl Into<String>) {
@@ -226,7 +259,13 @@ impl App {
                 self.log.clear();
                 self.push_log(Level::Info, "日志已清空");
             }
+            Message::ApkDropped(path) => {
+                if !self.stage.busy() {
+                    self.accept_apk(path);
+                }
+            }
             Message::Tick => self.drain_workers(),
+            Message::Ignored => {}
         }
     }
 
@@ -245,18 +284,9 @@ impl App {
             self.pick_rx = None;
             // 用户取消时 v 是 None，什么都不做
             if let Some(choice) = v {
-                self.push_log(
-                    Level::Info,
-                    format!("已选择 {}（{}）", choice.name, human_size(choice.size)),
-                );
-                self.apk = Some(choice);
-                // 换包之后把上一次的安装结果清掉，免得混淆
-                if matches!(self.stage, Stage::Done | Stage::Failed) {
-                    self.reset();
-                }
+                self.accept_apk(choice.path);
             }
         }
-
         // ---- 相机 / 安装线程 ----
         let mut msgs = Vec::new();
         let mut disconnected = false;
@@ -352,6 +382,37 @@ impl App {
                 self.push_log(Level::Bad, format!("安装失败：{e}"));
             }
         }
+    }
+
+    // ------------------------------------------------------------ 只读查询
+    //
+    // 给集成测试用的（也方便以后加"导出诊断信息"之类的功能）。
+    // 故意只暴露**只读**视图：外部改不了状态，状态只能通过 `update` 变 ——
+    // 单向数据流不能被绕过。
+
+    /// 当前处在哪一步
+    pub fn stage(&self) -> Stage {
+        self.stage
+    }
+
+    /// 当前状态文字
+    pub fn status_text(&self) -> &str {
+        &self.status
+    }
+
+    /// 当前进度
+    pub fn percent(&self) -> u8 {
+        self.percent
+    }
+
+    /// 日志内容（从旧到新）
+    pub fn log_lines(&self) -> impl Iterator<Item = &str> {
+        self.log.iter().map(|(_, s)| s.as_str())
+    }
+
+    /// 是否已经选好了应用包
+    pub fn has_apk(&self) -> bool {
+        self.apk.is_some()
     }
 
     // ------------------------------------------------------------ 视图
