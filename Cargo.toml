@@ -37,6 +37,10 @@ features = [
     "Win32_System_Com",
     "Win32_System_Variant",
     "Win32_UI_Shell_PropertiesSystem",
+    # 用 SetupAPI 枚举所有索尼 USB 设备 —— 这样即使相机设成了
+    # 「海量存储器」（不是 WPD 设备），也能认出"相机其实插着，只是模式不对"
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Devices_Properties",
 ]
 
 [profile.release]

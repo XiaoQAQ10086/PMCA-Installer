@@ -84,6 +84,36 @@ fn step(report: Reporter, text: impl Into<String>) {
 
 // ---------------------------------------------------------------- 相机
 
+/// WPD 找不到相机时，生成**准确**的原因说明。
+///
+/// # 为什么不能只说"没找到相机"
+///
+/// 索尼相机的 USB 连接方式是可以在菜单里改的。设成「海量存储器」时，
+/// 相机在 Windows 里就是个 U 盘 —— 而我们的传输层走的是 WPD（便携设备），
+/// 自然一台都看不到。
+///
+/// 这时候如果说"没有找到索尼相机"，用户会去检查线材、开机状态、USB 口，
+/// **方向完全错了**：相机明明插着，只是菜单里一个选项不对。
+///
+/// 所以这里再问一次系统（用 SetupAPI 按「USB」枚举器找，与设备类无关）：
+/// - 找到索尼 USB 设备、且不是 MTP 模式 → 明确说是"海量存储器"的问题
+/// - 找到索尼 USB 设备、但本来就是 MTP 模式 → 那是 Windows 驱动/服务的问题
+/// - 什么都没找到 → 才是真的没插
+fn no_camera_found() -> anyhow::Error {
+    let ids = sony_usb::usbdev::list_usb_ids_of_vendor(sony_usb::SONY_VENDOR_ID);
+    if ids.is_empty() {
+        anyhow::anyhow!(
+            "没有找到索尼相机。\n\
+             请确认：\n\
+             ① 相机已开机、USB 线已插好（要能传数据的线，不是只充电的线）\n\
+             ② 相机菜单里的 USB 连接方式不是「海量存储器」\n\
+             ③ 没有别的程序占用相机（照片应用、资源管理器预览、原版 PMCA 等）"
+        )
+    } else {
+        anyhow::anyhow!("{}", sony_usb::usbdev::describe_present_but_not_wpd(&ids))
+    }
+}
+
 /// 读一次相机信息（打开会话 + 读设备信息）
 ///
 /// ⚠️ **这里故意不发 `CLOSE_SESSION`**。
@@ -115,7 +145,8 @@ fn read_info(pnp_id: &str) -> Result<sony_core::mtp::DeviceInfo> {
 /// - 插了但读不出来 → `Err`
 pub fn probe_camera() -> Result<Option<CameraStatus>> {
     let Some(dev) = sony_usb::find_sony_camera().context("枚举设备失败")? else {
-        return Ok(None);
+        // 不是简单返回"没有"，而是把真正的原因带出来
+        return Err(no_camera_found());
     };
     let info = read_info(&dev.pnp_id)?;
     Ok(Some(CameraStatus {
@@ -141,13 +172,7 @@ pub fn find_and_prepare_camera(report: Reporter) -> Result<CameraStatus> {
 
     let devices = sony_usb::list_sony_devices().context("枚举设备失败")?;
     if devices.is_empty() {
-        anyhow::bail!(
-            "没有找到索尼相机。\n\
-             请确认：\n\
-             ① 相机已开机、USB 线已插好（要能传数据的线，不是只充电的线）\n\
-             ② 相机菜单里的 USB 连接方式是「应用安装」相关选项\n\
-             ③ 没有别的程序占用相机（照片应用、资源管理器预览、原版 PMCA 等）"
-        );
+        return Err(no_camera_found());
     }
     step(report, "找到索尼设备，正在确认哪一台是相机…");
 

@@ -27,6 +27,7 @@
 use anyhow::Result;
 
 pub mod ffi;
+pub mod usbdev;
 pub mod wpd;
 
 pub use wpd::{WpdDevice, WpdTransport};
