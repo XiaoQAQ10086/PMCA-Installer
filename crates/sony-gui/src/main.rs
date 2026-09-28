@@ -36,6 +36,35 @@ use sony_gui::app::{App, Message};
 use sony_gui::fonts::{self, Fonts};
 use sony_gui::theme;
 
+/// 窗口图标：预先解码好的**原始 RGBA** 像素（128×128）。
+///
+/// 由 `python tools/make_icon.py <源图.png>` 生成。
+///
+/// # 为什么不内嵌 PNG、启动时再解码
+///
+/// 那样就得引入一个 PNG 解码库。而窗口图标在标题栏/任务栏最多显示到
+/// 48 像素左右，128×128 足够覆盖高 DPI；原始数据 64 KB，
+/// 比多一个依赖划算，而且启动时**不需要解码**、更快。
+const WINDOW_ICON_RGBA: &[u8] = include_bytes!("../assets/icon-rgba.bin");
+
+/// `WINDOW_ICON_RGBA` 的边长
+const WINDOW_ICON_SIZE: u32 = 128;
+
+/// 构造窗口图标（标题栏 + 任务栏 + Alt+Tab 用）。
+///
+/// ⚠️ 注意 `from_rgba` 是 `window::icon` 模块里的**自由函数**，
+/// **不是** `Icon` 的方法 —— 写成 `Icon::from_rgba(...)` 编译不过。
+///
+/// 失败就返回 `None`：没有图标也能正常用，不该因此启动不了。
+fn window_icon() -> Option<window::Icon> {
+    window::icon::from_rgba(
+        WINDOW_ICON_RGBA.to_vec(),
+        WINDOW_ICON_SIZE,
+        WINDOW_ICON_SIZE,
+    )
+    .ok()
+}
+
 fn main() -> iced::Result {
     // 命令行可以带一个 APK 路径
     let initial_apk = std::env::args_os().nth(1).map(PathBuf::from);
@@ -84,6 +113,7 @@ fn main() -> iced::Result {
         size: Size::new(760.0, 660.0),
         min_size: Some(Size::new(620.0, 520.0)),
         resizable: true,
+        icon: window_icon(),
         ..window::Settings::default()
     })
     .subscription(|_: &App| {
@@ -188,3 +218,30 @@ fn attach_parent_console() {
 
 #[cfg(not(windows))]
 fn attach_parent_console() {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 内嵌的窗口图标数据必须与声明的尺寸对得上。
+    ///
+    /// 这个文件是脚本生成的，万一尺寸和常量不一致，
+    /// `from_rgba` 会失败、图标静默消失 —— 加个测试盯住它。
+    #[test]
+    fn window_icon_data_matches_declared_size() {
+        let expected = (WINDOW_ICON_SIZE * WINDOW_ICON_SIZE * 4) as usize;
+        assert_eq!(
+            WINDOW_ICON_RGBA.len(),
+            expected,
+            "icon-rgba.bin 大小不对：期望 {expected} 字节（{WINDOW_ICON_SIZE}×{WINDOW_ICON_SIZE} RGBA），\
+             实际 {} 字节。改了图标请重跑 python tools/make_icon.py",
+            WINDOW_ICON_RGBA.len()
+        );
+    }
+
+    /// 用真实数据构造一次，确认 iced 能接受
+    #[test]
+    fn window_icon_can_be_built() {
+        assert!(window_icon().is_some(), "内嵌的图标数据应当能构造出 Icon");
+    }
+}

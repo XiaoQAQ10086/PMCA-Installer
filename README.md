@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="crates/sony-gui/assets/icon.png" width="128" alt="PMCA 安装器图标">
+</p>
+
 # PMCA 安装器
 
 **在 Windows 上给索尼相机安装 Android 应用的小工具。**
