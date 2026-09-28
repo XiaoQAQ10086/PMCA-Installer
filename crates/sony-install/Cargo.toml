@@ -1,0 +1,12 @@
+[package]
+name = "sony-install"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "把 APK 安装到索尼相机上的完整流程（命令行与图形界面共用）"
+
+[dependencies]
+sony-core = { path = "../sony-core" }
+sony-usb = { path = "../sony-usb" }
+anyhow.workspace = true

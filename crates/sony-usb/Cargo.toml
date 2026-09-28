@@ -1,0 +1,21 @@
+[package]
+name = "sony-usb"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+# 需要 C 薄封装来访问 Windows 的 WPD 接口（见 build.rs 与 src/wpd_shim.c）
+build = "build.rs"
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+sony-core = { path = "../sony-core" }
+
+# 只用它调用 CoInitializeEx / CoUninitialize 管理 COM 生命周期；
+# WPD 接口本身在 C 薄封装里。
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
+[build-dependencies]
+cc = "1.0"

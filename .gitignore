@@ -1,0 +1,14 @@
+# 编译产物
+/target
+**/*.rs.bk
+
+# 诊断日志（每次运行都会生成）
+install-diag.log
+*.log
+
+# 临时文件
+*.broken
+*.tmp
+
+# 打包出来的安装包
+*.spk

@@ -1,0 +1,36 @@
+[package]
+name = "sony-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+# 十六进制编解码（CIC 密钥、校验值）
+hex.workspace = true
+
+# 商店 JSON 响应（相机只认紧凑格式）
+serde.workspace = true
+serde_json.workspace = true
+
+# 手写 TLS 1.0 用到的密码学原语（纯 Rust）
+rsa.workspace = true
+sha1.workspace = true
+md-5.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+aes.workspace = true
+cbc.workspace = true
+pem.workspace = true
+
+# RSA 解密出来的预主密钥要按大整数处理
+num-bigint-dig.workspace = true
+
+# 用于和 sha1/hmac 对齐版本
+digest = "0.10"
+
+[dev-dependencies]
+hex.workspace = true

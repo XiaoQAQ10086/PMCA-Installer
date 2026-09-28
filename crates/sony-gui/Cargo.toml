@@ -1,0 +1,33 @@
+[package]
+name = "sony-gui"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "索尼相机应用安装器（图形界面）"
+
+[[bin]]
+name = "sony-app-installer"
+path = "src/main.rs"
+
+[dependencies]
+sony-core = { path = "../sony-core" }
+sony-usb = { path = "../sony-usb" }
+sony-install = { path = "../sony-install" }
+anyhow.workspace = true
+tracing.workspace = true
+serde_json.workspace = true
+
+# 只启用 Windows 上真正需要的部分：
+# - tiny-skia：纯 CPU 渲染，不需要显卡依赖，体积小、启动快
+# - smol：最轻的异步执行器（iced 必须要一个，用来跑 Task）
+# - 关掉默认特性，避免把 wgpu（几十 MB）和 x11/wayland 一起拉进来
+iced = { version = "0.14", default-features = false, features = [
+    "tiny-skia",
+    "crisp",
+    "web-colors",
+    "smol",
+] }
+
+# 原生「打开文件」对话框
+rfd = "0.15"

@@ -1,0 +1,16 @@
+[package]
+name = "app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+sony-core = { path = "../sony-core" }
+sony-usb = { path = "../sony-usb" }
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+rsa.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
