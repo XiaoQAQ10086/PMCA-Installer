@@ -96,7 +96,7 @@
 需要 Rust（1.88 或更新）和 MSVC 生成工具。
 
 ```bash
-git clone <本仓库地址>
+git clone https://github.com/XiaoQAQ10086/PMCA-Installer.git
 cd sony-app-installer
 
 # 开发时运行（会保留控制台窗口，方便看日志）
