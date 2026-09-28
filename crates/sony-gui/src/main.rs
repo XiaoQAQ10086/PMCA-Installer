@@ -14,10 +14,18 @@
 //!    - 不需要显卡驱动配合，老机器/虚拟机也能跑
 //!    - 编出来的 exe 小得多、启动更快
 //!
-//! 2. **中文字体从系统加载**，不内嵌。
-//!    Windows 的中文字体都很大（微软雅黑 18.8 MB），
-//!    内嵌会让 exe 从 4 MB 膨胀到 20 MB 以上。
-//!    详见 `fonts.rs`。
+//! 2. **中文字体分两层**：内嵌界面用字的小子集（58 KB，保证界面永远能显示）
+//!    + 系统字体（覆盖文件名里的任意中文）。详见 `fonts.rs`。
+
+// ⚠️ 关键：告诉 Windows 这是**图形程序**，不要给它开控制台窗口。
+//
+// 不加这一行，双击运行时系统会额外弹一个黑色 cmd 窗口 —— 很难看，
+// 而且用户关掉那个黑框会把程序一起关掉。
+//
+// `cfg_attr(not(debug_assertions), ...)` 的意思是：
+// **只有发布版**才隐藏控制台；开发时（debug）保留黑框，
+// 这样 `cargo run` 还能看到 println! 的输出，方便排查问题。
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::path::PathBuf;
 
@@ -95,12 +103,47 @@ fn main() -> iced::Result {
     application.run()
 }
 
+/// 打印用法。
+///
+/// ⚠️ 发布版是 GUI 子系统程序，**自己没有控制台**。
+/// 如果是从 `cmd` 里运行的，可以"借"父进程的控制台来输出；
+/// 双击运行时借不到，输出就丢弃（这是预期行为，不是错误）。
 fn print_help() {
-    println!("索尼相机应用安装器");
-    println!();
-    println!("用法：");
-    println!("  索尼相机应用安装器.exe [应用包路径]");
-    println!();
-    println!("不带参数直接双击运行也可以，在界面里点「选择文件…」即可。");
-    println!("也可以把 APK 文件直接拖进窗口，或拖到本程序的图标上。");
+    attach_parent_console();
+
+    use std::io::Write;
+    // 用 `let _ =`：没有控制台时写不出去，不该 panic
+    let _ = writeln!(std::io::stdout(), "索尼相机应用安装器");
+    let _ = writeln!(std::io::stdout());
+    let _ = writeln!(std::io::stdout(), "用法：");
+    let _ = writeln!(std::io::stdout(), "  索尼相机应用安装器.exe [应用包路径]");
+    let _ = writeln!(std::io::stdout());
+    let _ = writeln!(
+        std::io::stdout(),
+        "不带参数直接双击运行也可以，在界面里点「选择文件…」即可。"
+    );
+    let _ = writeln!(
+        std::io::stdout(),
+        "也可以把 APK 文件直接拖进窗口，或拖到本程序的图标上。"
+    );
 }
+
+/// 尝试接管父进程的控制台（仅在从 cmd/PowerShell 启动时有效）。
+///
+/// 自己声明 FFI 而不引入 `windows-sys`：只用一个函数，
+/// 为它拉一整个依赖不划算。
+#[cfg(windows)]
+fn attach_parent_console() {
+    // ATTACH_PARENT_PROCESS = -1（u32 全 1）
+    const ATTACH_PARENT_PROCESS: u32 = 0xFFFF_FFFF;
+    unsafe extern "system" {
+        fn AttachConsole(dw_process_id: u32) -> i32;
+    }
+    // 失败也无所谓（双击运行时就是这样）
+    unsafe {
+        AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+}
+
+#[cfg(not(windows))]
+fn attach_parent_console() {}

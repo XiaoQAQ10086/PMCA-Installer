@@ -169,12 +169,25 @@ pub fn diag_init(path: &str) -> std::io::Result<()> {
 ///
 /// 带**毫秒时间戳** —— 真机联调时"什么时候发的什么"往往和内容一样重要
 /// （能看出相机是不是在等某个超时、响应是不是太慢）。
+///
+/// ⚠️ 这里**不能用 `eprintln!`**。
+/// 图形界面版是 GUI 子系统程序（不弹黑框），**没有控制台**，
+/// 此时 stderr 句柄是无效的，而 `eprintln!` 写失败时会 **panic**
+/// （`failed printing to stderr`）—— 等于"因为写不了日志把安装搞崩了"。
+///
+/// 所以用 `let _ = writeln!(...)`：写不出去就算了，
+/// 诊断输出本来就不该影响主流程。
 pub fn trace_diag(msg: &str) {
     let ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() % 100_000_000)
         .unwrap_or(0);
-    eprintln!("[{ms:08}] {msg}");
+
+    {
+        use std::io::Write;
+        let _ = writeln!(std::io::stderr(), "[{ms:08}] {msg}");
+    }
+
     if let Ok(mut g) = DIAG_FILE.lock()
         && let Some(f) = g.as_mut()
     {

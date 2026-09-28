@@ -139,17 +139,53 @@ pub fn find_and_prepare_camera(report: Reporter) -> Result<CameraStatus> {
     use sony_core::mtp;
     use sony_core::transport::PtpTransport;
 
-    let Some(mut dev) = sony_usb::find_sony_camera().context("枚举设备失败")? else {
+    let devices = sony_usb::list_sony_devices().context("枚举设备失败")?;
+    if devices.is_empty() {
         anyhow::bail!(
             "没有找到索尼相机。\n\
              请确认：\n\
-             ① 相机已开机、USB 线已插好\n\
-             ② 没有别的程序（比如原版 PMCA）占用相机"
+             ① 相机已开机、USB 线已插好（要能传数据的线，不是只充电的线）\n\
+             ② 相机菜单里的 USB 连接方式是「应用安装」相关选项\n\
+             ③ 没有别的程序占用相机（照片应用、资源管理器预览、原版 PMCA 等）"
+        );
+    }
+    step(report, "找到索尼设备，正在确认哪一台是相机…");
+
+    // ⚠️ 为什么要**逐个试**而不是直接拿第一台：
+    //    我们只按"厂商 = 索尼"筛设备。如果用户同时插着索尼手机、随身听、
+    //    读卡器之类的东西，第一台未必是相机。
+    //    真正的相机会回应「读设备信息」，用这个来确认。
+    let mut found: Option<(sony_usb::WpdDevice, mtp::DeviceInfo)> = None;
+    let mut last_error: Option<anyhow::Error> = None;
+    for dev in devices {
+        match read_info(&dev.pnp_id) {
+            Ok(info) => {
+                found = Some((dev, info));
+                break;
+            }
+            Err(e) => {
+                sony_core::market::trace_diag(&format!(
+                    "[设备] {} 不是相机或读不出来：{e}",
+                    dev.pnp_id
+                ));
+                last_error = Some(e);
+            }
+        }
+    }
+
+    let Some((dev, info)) = found else {
+        let detail = last_error
+            .map(|e| format!("\n最后一次尝试的原因：{e:#}"))
+            .unwrap_or_default();
+        anyhow::bail!(
+            "找到了索尼设备，但都不是相机（或者读不出设备信息）。\n\
+             请确认插的是相机，并且没有别的程序占用它。{detail}"
         );
     };
-    step(report, "找到相机，正在读取信息…");
 
-    let info = read_info(&dev.pnp_id)?;
+    step(report, format!("相机：{}（{}）", info.model, info.serial_number));
+
+    // 已经在应用安装模式 → 直接可用
     if info.supports_all(&PROXY_OPS) {
         return Ok(CameraStatus {
             pnp_id: dev.pnp_id,
@@ -159,18 +195,27 @@ pub fn find_and_prepare_camera(report: Reporter) -> Result<CameraStatus> {
         });
     }
 
-    // 不在安装模式 —— 先确认它有办法切过去
+    // ---- 不在安装模式，试着让相机自己切过去 ----
+    //
+    // 能不能切，取决于相机支不支持索尼的扩展命令。
+    // 不支持就说明**这台相机根本装不了应用**（不是操作问题），
+    // 这时候要把话说清楚，别让用户以为是哪里插错了。
     if !info.supports_all(&[
         mtp::PTP_OC_SONY_DI_EXT_CMD_WRITE,
         mtp::PTP_OC_SONY_DI_EXT_CMD_READ,
     ]) {
         anyhow::bail!(
-            "这台相机在当前模式下既不支持代理消息、也不支持索尼扩展命令，无法安装应用。\n\
-             支持的操作码：{:?}",
+            "这台相机（{}）不支持安装应用。\n\
+             它既没有「代理消息」能力，也没有索尼的扩展安装命令。\n\
+             能装的机型需要支持 PlayMemories Camera Apps（比如 ILCE-6300 这类带\n\
+             应用商店的机型）。\n\
+             相机报告的操作码：{}",
+            info.model,
             info.operations_supported
                 .iter()
                 .map(|c| format!("0x{c:04x}"))
                 .collect::<Vec<_>>()
+                .join("、")
         );
     }
 
@@ -178,45 +223,67 @@ pub fn find_and_prepare_camera(report: Reporter) -> Result<CameraStatus> {
     {
         let mut t = sony_usb::WpdTransport::open(&dev.pnp_id).context("打开相机失败")?;
         let _ = PtpTransport::send_command(&mut t, mtp::PTP_OC_OPEN_SESSION, &[1]);
-        // 即使这条命令报错，相机也可能已经切了，所以不直接失败
+        // 即使这条命令报错，相机也可能已经切了，所以不直接失败。
+        //
+        // ⚠️ 这里**不要**补 `CLOSE_SESSION`：MTP 的这个命令要带会话号参数，
+        //    传空参数是畸形请求。见 `read_info` 上的说明。
         if let Err(e) = PtpTransport::switch_to_app_install_mode(&mut t) {
             step(report, format!("提示：{e}（相机可能仍会切换，继续等待）"));
         }
-        let _ = PtpTransport::send_command(&mut t, mtp::PTP_OC_CLOSE_SESSION, &[]);
     }
 
     // 等相机重新枚举成"应用安装模式"
+    //
+    // 顺便记一件事：**相机有没有因为这条命令而重新枚举**。
+    // 这个信息能区分两种完全不同的情况：
+    // - 重新枚举了，但没进安装模式 → 相机支持，只是这次没成，拔插重试即可
+    // - 压根没重新枚举         → 相机不理这条命令，多半是**不支持装应用**
+    let old_pnp_id = dev.pnp_id.clone();
+    let mut re_enumerated = false;
     let deadline = Instant::now() + Duration::from_secs(25);
     while Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(500));
-        let Ok(Some(d)) = sony_usb::find_sony_camera() else {
-            continue;
+        let devices = match sony_usb::list_sony_devices() {
+            Ok(d) => d,
+            Err(_) => continue,
         };
-        if d.pnp_id == dev.pnp_id {
-            continue; // 还是老设备，还没切完
-        }
-        // 设备换了，确认一下新模式
-        std::thread::sleep(Duration::from_millis(400));
-        if let Ok(info) = read_info(&d.pnp_id)
-            && info.supports_all(&PROXY_OPS)
-        {
-            dev = d;
-            step(report, "切换成功");
-            // 刚重新枚举出来的设备还需要一点点时间才稳定，
-            // 否则紧接着开会话可能拿到 0x8007001F
-            std::thread::sleep(Duration::from_millis(600));
-            return Ok(CameraStatus {
-                pnp_id: dev.pnp_id,
-                model: info.model,
-                serial: info.serial_number,
-                app_install_mode: true,
-            });
+        for d in devices {
+            if d.pnp_id == old_pnp_id {
+                continue; // 还是老设备，还没切完
+            }
+            re_enumerated = true;
+            // 设备换了，确认一下新模式
+            std::thread::sleep(Duration::from_millis(400));
+            if let Ok(info) = read_info(&d.pnp_id)
+                && info.supports_all(&PROXY_OPS)
+            {
+                step(report, "切换成功");
+                // 刚重新枚举出来的设备还需要一点点时间才稳定，
+                // 否则紧接着开会话可能拿到 0x8007001F
+                std::thread::sleep(Duration::from_millis(600));
+                return Ok(CameraStatus {
+                    pnp_id: d.pnp_id,
+                    model: info.model,
+                    serial: info.serial_number,
+                    app_install_mode: true,
+                });
+            }
         }
     }
 
+    if re_enumerated {
+        anyhow::bail!(
+            "相机切换了模式，但没能进入「应用安装模式」。\n\
+             请把相机 USB 线拔下再插上，然后重试。"
+        );
+    }
     anyhow::bail!(
-        "等待相机切换到应用安装模式超时（25 秒）。\n\
-         请把相机 USB 线拔下再插上，然后重试。"
+        "相机没有响应「切换到应用安装模式」的命令（等了 25 秒）。\n\
+         这通常说明**这台相机不支持安装应用**。\n\
+         相机型号：{}\n\
+         能装应用的机型需要支持 PlayMemories Camera Apps。\n\
+         如果你的相机确实支持，请把 USB 线拔下再插上后重试。",
+        info.model
     )
 }
 
