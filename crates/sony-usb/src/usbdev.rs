@@ -178,51 +178,72 @@ fn mode_hint(product: u16) -> Option<&'static str> {
     }
 }
 
-/// 给"WPD 找不到相机、但系统里确实有索尼 USB 设备"这种情况生成提示。
-///
-/// 这里要分清两种**完全不同**的原因，否则用户会被带到错误的方向：
-///
-/// 1. 设备是**别的模式**（海量存储器 / 电脑遥控）
-///    → 相机在 Windows 里根本不是"便携设备"，改相机菜单里的 USB 设置就行
-/// 2. 设备是 **MTP 模式**（本来就该被 WPD 看到），却还是没被列出来
-///    → 这不是相机设置问题，多半是驱动/服务的问题，拔插或重启
-pub fn describe_present_but_not_wpd(ids: &[UsbId]) -> String {
-    let detail = ids
-        .iter()
-        .map(|id| match mode_hint(id.product) {
-            Some(hint) => format!("054C:{:04X}（{hint}）", id.product),
-            None => format!("054C:{:04X}（不是便携设备模式）", id.product),
-        })
-        .collect::<Vec<_>>()
-        .join("、");
+/// 索尼设备"在系统里是什么样子"的分类
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Presence {
+    /// 一台索尼 USB 设备都没有
+    None,
+    /// 找到了索尼设备，但它不是 MTP 模式（典型：海量存储器）
+    WrongMode,
+    /// 找到了 MTP 模式的索尼设备，却没被 WPD 列出来
+    /// （说明问题在 Windows 的驱动/服务，不是相机设置）
+    NotVisible,
+}
 
-    // 只要有一个"本来就该被 WPD 看到"的设备，就说明问题出在驱动/服务那一侧
-    let should_have_been_visible = ids.iter().any(|i| mode_hint(i.product).is_some());
-
-    if should_have_been_visible {
-        return format!(
-            "相机插着、也是 MTP 模式，但 Windows 的「便携设备」列表里没有它。\n\
-             设备：{detail}\n\
-             \n\
-             这说明问题不在相机设置，而在 Windows 这一侧。可以按顺序试：\n\
-             ① 把相机 USB 线拔下再插上（最常见，往往一次就好）\n\
-             ② 换一个 USB 口，别用 USB 集线器\n\
-             ③ 关掉可能占用相机的程序（照片应用、资源管理器预览、原版 PMCA）\n\
-             ④ 重启电脑（便携设备服务偶发出问题时需要）"
-        );
+/// 把「枚举到的索尼 USB 设备」归类
+///
+/// 这一步决定了给用户的提示方向 —— 归错了就会把用户带到错误的地方：
+/// 明明是相机菜单里一个选项不对，却让人去拔插线材、换 USB 口。
+pub fn classify(ids: &[UsbId]) -> Presence {
+    if ids.is_empty() {
+        return Presence::None;
     }
+    // 有"本来就该被 WPD 看到"的设备（普通 MTP / 应用安装模式），
+    // 却还是没被列出来 → 问题在 Windows 那一侧
+    if ids.iter().any(|i| mode_hint(i.product).is_some()) {
+        Presence::NotVisible
+    } else {
+        Presence::WrongMode
+    }
+}
 
-    // 只说该怎么做，不解释原理 —— 用户要的是"我该按哪里"，
-    // 不是"为什么海量存储器不行"。
-    // 设备号这类排查用的信息交给诊断日志，不占提示的位置。
-    let _ = detail;
-    "请把相机的 USB 连接方式改成「MTP」。\n\
+/// 「USB 连接方式不对」的提示文字。
+///
+/// 只说该怎么做，不解释原理 —— 用户要的是"我该按哪里"，
+/// 不是"为什么海量存储器不行"。
+pub const WRONG_MODE_MESSAGE: &str = "请把相机的 USB 连接方式改成「MTP」。\n\
      \n\
      做法（在相机上改一次就行）：\n\
-     菜单 → 设置 → USB → USB 连接 → 选「MTP」（有「自动」也可以）\n\
+     菜单 → 设置 → USB → USB 连接 → 选「MTP」\n\
      \n\
-     改完把 USB 线拔下来再插上，然后重新点「开始安装」。"
-        .to_string()
+     改完把 USB 线拔下来再插上，然后重新点「开始安装」。";
+
+/// 「MTP 设备存在、但 WPD 看不到」的提示文字
+pub fn not_visible_message(ids: &[UsbId]) -> String {
+    let detail = ids
+        .iter()
+        .map(|id| format!("054C:{:04X}", id.product))
+        .collect::<Vec<_>>()
+        .join("、");
+    format!(
+        "相机插着、也是 MTP 模式，但 Windows 的「便携设备」列表里没有它。\n\
+         设备：{detail}\n\
+         \n\
+         这说明问题不在相机设置，而在 Windows 这一侧。可以按顺序试：\n\
+         ① 把相机 USB 线拔下再插上（最常见，往往一次就好）\n\
+         ② 换一个 USB 口，别用 USB 集线器\n\
+         ③ 关掉可能占用相机的程序（照片应用、资源管理器预览、原版 PMCA）\n\
+         ④ 重启电脑（便携设备服务偶发出问题时需要）"
+    )
+}
+
+/// 按分类生成提示文字
+pub fn message_for(ids: &[UsbId]) -> Option<String> {
+    match classify(ids) {
+        Presence::None => None,
+        Presence::WrongMode => Some(WRONG_MODE_MESSAGE.to_string()),
+        Presence::NotVisible => Some(not_visible_message(ids)),
+    }
 }
 
 #[cfg(test)]
@@ -254,13 +275,15 @@ mod tests {
     }
 
     /// 设备是"未知 PID"（也就是非 MTP 模式，典型就是海量存储器）
-    /// → 提示只需要教用户**怎么改成 MTP**，不用解释原理
+    /// → 归类为 WrongMode，提示只需要教用户**怎么改成 MTP**
     #[test]
-    fn unknown_pid_just_tells_how_to_switch_to_mtp() {
-        let msg = describe_present_but_not_wpd(&[UsbId {
+    fn unknown_pid_is_wrong_mode() {
+        let ids = [UsbId {
             vendor: 0x054C,
             product: 0x0AAA, // 编一个：既不是 MTP 也不是应用安装模式
-        }]);
+        }];
+        assert_eq!(classify(&ids), Presence::WrongMode);
+        let msg = message_for(&ids).expect("这种分类必须给出提示");
         // 要教清楚怎么改
         assert!(msg.contains("MTP"), "必须给出改法：{msg}");
         assert!(msg.contains("菜单"), "要说清楚是在相机菜单里改");
@@ -269,16 +292,20 @@ mod tests {
         assert!(!msg.contains("海量存储器"), "不用解释为什么不行：{msg}");
         assert!(!msg.contains("0AAA"), "不该把设备号摆给用户看：{msg}");
         assert!(!msg.contains("U 盘"), "不用解释原理：{msg}");
+        // 用户要求：只推荐 MTP，不要再给"自动"这个第二选项
+        assert!(!msg.contains("自动"), "不要给第二个选项：{msg}");
     }
 
     /// 设备**本来就是 MTP 模式**却没被 WPD 列出来
     /// → 问题在 Windows 这一侧，不该让用户去改相机设置
     #[test]
     fn known_mtp_pid_points_at_windows_side() {
-        let msg = describe_present_but_not_wpd(&[UsbId {
+        let ids = [UsbId {
             vendor: 0x054C,
             product: 0x077A, // 已知的普通 MTP 模式
-        }]);
+        }];
+        assert_eq!(classify(&ids), Presence::NotVisible);
+        let msg = message_for(&ids).expect("这种分类必须给出提示");
         assert!(
             msg.contains("便携设备"),
             "要说明是 Windows 没认出来：{msg}"
@@ -288,6 +315,30 @@ mod tests {
         assert!(
             !msg.contains("海量存储器"),
             "MTP 模式下不该提海量存储器：{msg}"
+        );
+    }
+
+    /// 什么都没插 → 归类为 None，不该硬凑一条提示出来
+    #[test]
+    fn nothing_plugged_in_gives_no_message() {
+        assert_eq!(classify(&[]), Presence::None);
+        assert!(message_for(&[]).is_none());
+    }
+
+    /// 什么都没插 → 分类是 None，不该编出一条提示
+    #[test]
+    fn no_device_gives_no_message() {
+        assert_eq!(classify(&[]), Presence::None);
+        assert!(message_for(&[]).is_none(), "没插就不该硬凑提示");
+    }
+
+    /// 提示里不能再出现"自动"这个可选值（用户要求只推荐 MTP）
+    #[test]
+    fn wrong_mode_message_only_mentions_mtp() {
+        assert!(WRONG_MODE_MESSAGE.contains("MTP"));
+        assert!(
+            !WRONG_MODE_MESSAGE.contains("自动"),
+            "只教用户改成 MTP，不要给第二个选项"
         );
     }
 

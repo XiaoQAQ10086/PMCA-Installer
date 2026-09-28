@@ -39,11 +39,18 @@ use sony_gui::theme;
 fn main() -> iced::Result {
     // 命令行可以带一个 APK 路径
     let initial_apk = std::env::args_os().nth(1).map(PathBuf::from);
-    if let Some(p) = &initial_apk
-        && matches!(p.to_string_lossy().as_ref(), "-h" | "--help" | "/?")
-    {
-        print_help();
-        return Ok(());
+    if let Some(p) = &initial_apk {
+        match p.to_string_lossy().as_ref() {
+            "-h" | "--help" | "/?" => {
+                print_help();
+                return Ok(());
+            }
+            "-V" | "--version" => {
+                print_version();
+                return Ok(());
+            }
+            _ => {}
+        }
     }
 
     // ---- 准备字体：内嵌的界面字体 + （如果有）系统字体 ----
@@ -66,7 +73,7 @@ fn main() -> iced::Result {
         App::update,
         App::view,
     )
-    .title("索尼相机应用安装器")
+    .title("PMCA 安装器 — 索尼相机应用安装工具")
     // ⚠️ 这几个闭包**必须写清参数类型**（`|_: &App|`）。
     //    只写 `|_|` 的话，Rust 会把生命周期推断成某一个具体的，
     //    而 iced 要求"对任意生命周期都成立"，于是报
@@ -103,29 +110,63 @@ fn main() -> iced::Result {
     application.run()
 }
 
-/// 打印用法。
+/// 往控制台输出文字（供 `--help` / `--version` 用）。
 ///
-/// ⚠️ 发布版是 GUI 子系统程序，**自己没有控制台**。
-/// 如果是从 `cmd` 里运行的，可以"借"父进程的控制台来输出；
-/// 双击运行时借不到，输出就丢弃（这是预期行为，不是错误）。
-fn print_help() {
-    attach_parent_console();
-
+/// ⚠️ **不能直接用 `println!`**，这里有个很隐蔽的坑：
+///
+/// 发布版是 GUI 子系统程序，**进程启动时没有控制台**。
+/// Rust 在那时候就已经把 stdout 定成了无效句柄 ——
+/// 之后再调 `AttachConsole` 也不会让它生效（std 把它缓存住了），
+/// 于是 `println!` 写出去直接失败。我们又用 `let _ =` 忽略错误，
+/// 结果就是**什么都不输出**（我一开始就是这样，`--help` 一片空白）。
+///
+/// 所以这里绕开 std 的缓存，自己打开 `CONOUT$` 来写。
+/// 双击运行时借不到控制台，打开失败 —— 静默丢弃，这是预期行为。
+fn console_print(text: &str) {
     use std::io::Write;
-    // 用 `let _ =`：没有控制台时写不出去，不该 panic
-    let _ = writeln!(std::io::stdout(), "索尼相机应用安装器");
-    let _ = writeln!(std::io::stdout());
-    let _ = writeln!(std::io::stdout(), "用法：");
-    let _ = writeln!(std::io::stdout(), "  索尼相机应用安装器.exe [应用包路径]");
-    let _ = writeln!(std::io::stdout());
-    let _ = writeln!(
-        std::io::stdout(),
-        "不带参数直接双击运行也可以，在界面里点「选择文件…」即可。"
-    );
-    let _ = writeln!(
-        std::io::stdout(),
-        "也可以把 APK 文件直接拖进窗口，或拖到本程序的图标上。"
-    );
+
+    // 第一种情况：stdout 是可用的。
+    //
+    // 从 `cmd` 里启动时，cmd 会把它的标准句柄传给子进程；
+    // 被重定向到文件或管道时更是如此（`PMCA-Installer.exe --version > v.txt`）。
+    // 这时候直接用 stdout 就行 —— 而且**必须**用 stdout，
+    // 否则重定向就失效了（写去控制台而不是文件，脚本就拿不到输出）。
+    {
+        let mut out = std::io::stdout();
+        if out.write_all(text.as_bytes()).is_ok() && out.flush().is_ok() {
+            return;
+        }
+    }
+
+    // 第二种情况：stdout 用不了，但进程其实有个控制台可以"借"。
+    // 打开 CONOUT$ 绕开 Rust 缓存住的无效句柄。
+    // 双击运行时两种都不成立 —— 静默丢弃，这是预期行为。
+    attach_parent_console();
+    if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open("CONOUT$") {
+        let _ = f.write_all(text.as_bytes());
+        let _ = f.flush();
+    }
+}
+
+/// 打印版本号
+fn print_version() {
+    console_print(&format!("PMCA 安装器 v{}\n", sony_gui::VERSION));
+}
+
+/// 打印用法
+fn print_help() {
+    console_print(&format!(
+        "PMCA 安装器 v{}\n\
+         索尼相机应用安装工具\n\
+         \n\
+         用法：\n\
+         \x20 PMCA-Installer.exe [应用包路径]\n\
+         \x20 PMCA-Installer.exe --version   查看版本\n\
+         \n\
+         不带参数直接双击运行也可以，在界面里点「选择文件…」即可。\n\
+         也可以把 APK 文件直接拖进窗口，或拖到本程序的图标上。\n",
+        sony_gui::VERSION
+    ));
 }
 
 /// 尝试接管父进程的控制台（仅在从 cmd/PowerShell 启动时有效）。

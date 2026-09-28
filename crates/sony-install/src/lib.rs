@@ -72,6 +72,55 @@ impl CameraStatus {
     }
 }
 
+/// 「检测相机」的结果。
+///
+/// ⚠️ 为什么不直接返回 `Result<Option<CameraStatus>>`：
+/// 界面上需要**分清"没插相机"和"插着但 USB 模式不对"** ——
+/// 这两种情况的卡片标题完全不同：
+/// - 没插相机         → 「未找到相机」
+/// - 模式不对（海量存储器）→ 「请把相机改成 MTP 模式」
+///
+/// 如果只回一个错误字符串，界面就只能一律显示"未找到相机"，
+/// 而这对"模式不对"的用户是**完全错误的指引**。
+#[derive(Debug, Clone)]
+pub enum CameraProbe {
+    /// 找到相机，可以直接用
+    Ready(CameraStatus),
+    /// 相机插着，但 USB 连接方式不对（最常见：海量存储器）
+    WrongUsbMode,
+    /// 插着索尼设备，但读不出设备信息（被别的程序占用 / 驱动问题）
+    Unreadable(String),
+    /// 没插相机
+    NotFound,
+}
+
+impl CameraProbe {
+    /// 这个结果该怎么显示（界面上的状态标题）
+    pub fn title(&self) -> &'static str {
+        match self {
+            CameraProbe::Ready(_) => "已连接",
+            CameraProbe::WrongUsbMode => "请把相机改成 MTP 模式",
+            CameraProbe::Unreadable(_) => "相机读不出来",
+            CameraProbe::NotFound => "未找到相机",
+        }
+    }
+
+    /// 详细说明（界面上标题下面那行）
+    pub fn detail(&self) -> Option<String> {
+        match self {
+            CameraProbe::Ready(s) => Some(format!(
+                "{} · 序列号 {} · 安装时自动切换到应用安装模式",
+                s.model, s.serial
+            )),
+            CameraProbe::WrongUsbMode => {
+                Some(sony_usb::usbdev::WRONG_MODE_MESSAGE.to_string())
+            }
+            CameraProbe::Unreadable(msg) => Some(msg.clone()),
+            CameraProbe::NotFound => None,
+        }
+    }
+}
+
 /// 安装过程中往外报告的事件
 #[derive(Debug, Clone)]
 pub enum Event {
@@ -126,7 +175,11 @@ fn no_camera_found() -> anyhow::Error {
                 .collect::<Vec<_>>()
                 .join("、")
         ));
-        anyhow::anyhow!("{}", sony_usb::usbdev::describe_present_but_not_wpd(&ids))
+        anyhow::anyhow!(
+            "{}",
+            sony_usb::usbdev::message_for(&ids)
+                .unwrap_or_else(|| "没有找到索尼相机。".to_string())
+        )
     }
 }
 
@@ -159,18 +212,61 @@ fn read_info(pnp_id: &str) -> Result<sony_core::mtp::DeviceInfo> {
 ///
 /// - 没插相机 → `Ok(None)`
 /// - 插了但读不出来 → `Err`
-pub fn probe_camera() -> Result<Option<CameraStatus>> {
-    let Some(dev) = sony_usb::find_sony_camera().context("枚举设备失败")? else {
-        // 不是简单返回"没有"，而是把真正的原因带出来
-        return Err(no_camera_found());
-    };
-    let info = read_info(&dev.pnp_id)?;
-    Ok(Some(CameraStatus {
-        pnp_id: dev.pnp_id,
-        model: info.model.clone(),
-        serial: info.serial_number.clone(),
-        app_install_mode: info.supports_all(&PROXY_OPS),
-    }))
+pub fn probe_camera() -> Result<CameraProbe> {
+    let devices = sony_usb::list_sony_devices().context("枚举设备失败")?;
+    if devices.is_empty() {
+        return Ok(classify_absent_camera());
+    }
+
+    // 逐个试：插着多个索尼设备时（手机、随身听…）要挑出真正能当相机用的那台
+    let mut last_error = None;
+    for dev in devices {
+        match read_info(&dev.pnp_id) {
+            Ok(info) => {
+                // 先算好再移动字段：`info.serial_number` 会被移走，
+                // 之后就不能再借用 `info` 了
+                let app_install_mode = info.supports_all(&PROXY_OPS);
+                return Ok(CameraProbe::Ready(CameraStatus {
+                    pnp_id: dev.pnp_id,
+                    model: info.model,
+                    serial: info.serial_number,
+                    app_install_mode,
+                }));
+            }
+            Err(e) => last_error = Some(e),
+        }
+    }
+
+    let detail = last_error
+        .map(|e| format!("{e:#}"))
+        .unwrap_or_else(|| "原因未知".to_string());
+    Ok(CameraProbe::Unreadable(format!(
+        "插着索尼设备，但读不出设备信息。\n\
+         请确认没有别的程序占用相机（照片应用、资源管理器预览、原版 PMCA）。\n\
+         技术细节：{detail}"
+    )))
+}
+
+/// WPD 一台都没看到时，用 USB 层再问一次，判断到底是"没插"还是"模式不对"
+fn classify_absent_camera() -> CameraProbe {
+    let ids = sony_usb::usbdev::list_usb_ids_of_vendor(sony_usb::SONY_VENDOR_ID);
+    // 设备号这类排查信息记进诊断日志，不摆到界面上
+    if !ids.is_empty() {
+        sony_core::market::trace_diag(&format!(
+            "[设备] WPD 看不到相机，但从 USB 枚举到的索尼设备：{}",
+            ids.iter()
+                .map(|i| format!("{:04X}:{:04X}", i.vendor, i.product))
+                .collect::<Vec<_>>()
+                .join("、")
+        ));
+    }
+    match sony_usb::usbdev::classify(&ids) {
+        sony_usb::usbdev::Presence::None => CameraProbe::NotFound,
+        sony_usb::usbdev::Presence::WrongMode => CameraProbe::WrongUsbMode,
+        sony_usb::usbdev::Presence::NotVisible => {
+            CameraProbe::Unreadable(sony_usb::usbdev::not_visible_message(&ids))
+        }
+    }
 }
 
 /// 找相机；如果不在应用安装模式，就**命令相机自己切过去**。

@@ -1,17 +1,18 @@
 [package]
 name = "sony-gui"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "索尼相机应用安装器（图形界面）"
+description = "PMCA 安装器 —— 给索尼相机安装 Android 应用的图形工具"
 
 [lib]
 name = "sony_gui"
 path = "src/lib.rs"
 
 [[bin]]
-name = "sony-app-installer"
+# 发布用的可执行文件名（GitHub 上就叫这个）
+name = "PMCA-Installer"
 path = "src/main.rs"
 
 [dependencies]

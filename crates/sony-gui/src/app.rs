@@ -25,16 +25,24 @@ const MAX_LOG_LINES: usize = 400;
 
 // ---------------------------------------------------------------- 状态
 
-/// 相机的检测状态
+/// 相机的检测状态。
+///
+/// ⚠️ 这里刻意把「没插相机」和「插着但 USB 模式不对」**分成两种状态**：
+/// 后者（海量存储器）如果也显示"未找到相机"，就是在给用户**错误的指引** ——
+/// 相明明插着、线也好好的，用户会去拔插线材换 USB 口，怎么试都没用。
 #[derive(Debug, Clone)]
 pub enum Camera {
     /// 还没检测过
     Unknown,
     /// 正在检测
     Checking,
-    /// 没找到（附原因）
+    /// 没插相机
     Missing(String),
-    /// 找到了
+    /// 相机插着，但 USB 连接方式不对（海量存储器 / 电脑遥控）
+    WrongUsbMode(String),
+    /// 插着索尼设备但读不出信息（被占用 / 驱动问题）
+    Unreadable(String),
+    /// 找到了，可以用
     Found(sony_install::CameraStatus),
 }
 
@@ -323,22 +331,37 @@ impl App {
 
     fn on_worker(&mut self, msg: WorkerMsg) {
         match msg {
-            WorkerMsg::Camera(Ok(Some(status))) => {
-                self.push_log(
-                    Level::Good,
-                    format!(
-                        "找到相机 {}（{}），当前：{}",
-                        status.model,
-                        status.serial,
-                        status.mode_text()
-                    ),
-                );
-                self.camera = Camera::Found(status);
-            }
-            WorkerMsg::Camera(Ok(None)) => {
-                let why = "没有检测到索尼相机。请确认相机已开机、USB 线已插好。".to_string();
-                self.push_log(Level::Warn, &why);
-                self.camera = Camera::Missing(why);
+            WorkerMsg::Camera(Ok(probe)) => {
+                use sony_install::CameraProbe as P;
+                let detail = probe.detail().unwrap_or_default();
+                match probe {
+                    P::Ready(status) => {
+                        self.push_log(
+                            Level::Good,
+                            format!(
+                                "找到相机 {}（{}），当前：{}",
+                                status.model,
+                                status.serial,
+                                status.mode_text()
+                            ),
+                        );
+                        self.camera = Camera::Found(status);
+                    }
+                    P::WrongUsbMode => {
+                        self.push_log(Level::Warn, "相机插着，但 USB 连接方式不是 MTP");
+                        self.camera = Camera::WrongUsbMode(detail);
+                    }
+                    P::Unreadable(msg) => {
+                        self.push_log(Level::Bad, format!("相机读不出来：{msg}"));
+                        self.camera = Camera::Unreadable(detail);
+                    }
+                    P::NotFound => {
+                        let why =
+                            "没有检测到索尼相机。请确认相机已开机、USB 线已插好。".to_string();
+                        self.push_log(Level::Warn, &why);
+                        self.camera = Camera::Missing(why);
+                    }
+                }
             }
             WorkerMsg::Camera(Err(e)) => {
                 self.push_log(Level::Bad, format!("检测相机失败：{e}"));
@@ -440,11 +463,22 @@ impl App {
 
     /// 顶部标题
     fn header(&self) -> Element<'_, Message> {
-        let mut col = column![
-            text("索尼相机应用安装器")
+        // 标题行：软件名 + 右上角的版本号
+        let title_row = row![
+            text("PMCA 安装器")
                 .size(th::SIZE_TITLE)
                 .font(self.fonts.bold)
                 .color(th::TEXT),
+            space::horizontal(),
+            text(format!("v{}", crate::VERSION))
+                .size(th::SIZE_CAPTION)
+                .font(self.fonts.regular)
+                .color(th::TEXT_FAINT),
+        ]
+        .align_y(Alignment::End);
+
+        let mut col = column![
+            title_row,
             text("把 Android 应用装到索尼相机上 · 自动识别相机")
                 .size(th::SIZE_CAPTION)
                 .font(self.fonts.regular)
@@ -465,10 +499,19 @@ impl App {
 
     /// ① 相机
     fn camera_card(&self) -> Element<'_, Message> {
+        // ⚠️ 关键：**「没插相机」和「模式不对」必须显示不同的标题**。
+        //    如果相机设成了海量存储器却显示"未找到相机"，用户会去检查线材、
+        //    换 USB 口、重启相机 —— 方向全错。真正要做的只是改相机菜单里一个选项。
         let (dot_color, title, detail) = match &self.camera {
             Camera::Unknown => (th::TEXT_FAINT, "尚未检测".to_string(), String::new()),
             Camera::Checking => (th::ACCENT, "正在检测…".to_string(), String::new()),
             Camera::Missing(why) => (th::DANGER, "未找到相机".to_string(), why.clone()),
+            Camera::WrongUsbMode(how) => (
+                th::WARNING,
+                "请把相机改成 MTP 模式".to_string(),
+                how.clone(),
+            ),
+            Camera::Unreadable(why) => (th::DANGER, "相机读不出来".to_string(), why.clone()),
             Camera::Found(s) => (
                 if s.app_install_mode {
                     th::SUCCESS
@@ -875,19 +918,52 @@ mod tests {
     #[test]
     fn camera_found_and_missing_update_state() {
         let mut a = app();
-        a.on_worker(WorkerMsg::Camera(Ok(Some(sony_install::CameraStatus {
-            pnp_id: "x".into(),
-            model: "ILCE-6300".into(),
-            serial: "05130861".into(),
-            app_install_mode: false,
-        }))));
+        a.on_worker(WorkerMsg::Camera(Ok(sony_install::CameraProbe::Ready(
+            sony_install::CameraStatus {
+                pnp_id: "x".into(),
+                model: "ILCE-6300".into(),
+                serial: "05130861".into(),
+                app_install_mode: false,
+            },
+        ))));
         assert!(matches!(a.camera, Camera::Found(_)));
 
-        a.on_worker(WorkerMsg::Camera(Ok(None)));
+        a.on_worker(WorkerMsg::Camera(Ok(sony_install::CameraProbe::NotFound)));
         match &a.camera {
             Camera::Missing(why) => assert!(why.contains("没有检测到"), "要给出原因：{why}"),
             other => panic!("应是未找到状态，实际 {other:?}"),
         }
+    }
+
+    /// ⚠️ 关键回归测试：相机设成海量存储器时，
+    /// 界面**不能**显示"未找到相机"——那会让用户去查线材、换 USB 口。
+    /// 必须显示"请把相机改成 MTP 模式"。
+    #[test]
+    fn wrong_usb_mode_does_not_say_camera_not_found() {
+        let mut a = app();
+        a.on_worker(WorkerMsg::Camera(Ok(sony_install::CameraProbe::WrongUsbMode)));
+
+        match &a.camera {
+            Camera::WrongUsbMode(detail) => {
+                assert!(detail.contains("MTP"), "说明里要教用户改成 MTP：{detail}");
+                assert!(!detail.contains("自动"), "不要给第二个选项：{detail}");
+            }
+            other => panic!("应进「模式不对」状态，实际 {other:?}"),
+        }
+
+        // 卡片标题必须是"改成 MTP"，不是"未找到相机"
+        let title = sony_install::CameraProbe::WrongUsbMode.title();
+        assert_eq!(title, "请把相机改成 MTP 模式");
+        assert!(!title.contains("未找到"), "标题不能误导用户");
+    }
+
+    /// 真的没插相机时，仍然要显示"未找到相机"
+    #[test]
+    fn really_absent_still_says_not_found() {
+        assert_eq!(
+            sony_install::CameraProbe::NotFound.title(),
+            "未找到相机"
+        );
     }
 
     #[test]

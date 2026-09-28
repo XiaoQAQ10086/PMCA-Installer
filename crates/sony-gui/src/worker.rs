@@ -27,7 +27,7 @@
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, channel};
 
-use sony_install::{CameraStatus, Event, InstallOutcome};
+use sony_install::{CameraProbe, Event, InstallOutcome};
 
 /// 用户在对话框里选中的应用包
 #[derive(Debug, Clone)]
@@ -76,8 +76,8 @@ pub fn spawn_pick_apk() -> Receiver<Option<ApkChoice>> {
 /// 工作线程 → 界面线程的消息
 #[derive(Debug)]
 pub enum WorkerMsg {
-    /// 相机检测的结果（`Ok(None)` = 没插相机）
-    Camera(Result<Option<CameraStatus>, String>),
+    /// 相机检测的结果
+    Camera(Result<CameraProbe, String>),
     /// 一句进度说明
     Step(String),
     /// 安装进度
