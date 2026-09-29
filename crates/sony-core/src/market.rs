@@ -397,15 +397,7 @@ impl InstallRunner {
                 }
             }
         }
-        if !reply.is_empty() {
-            self.outgoing.push(
-                Outgoing::ProxyData {
-                    socket_fd,
-                    data: reply,
-                }
-                .encode(),
-            );
-        }
+        push_proxy_data(&mut self.outgoing, socket_fd, &reply);
         // 真机实测：相机只发了 TLS 的 close_notify，**没发隧道层的断开请求**。
         // 它可能在等我们把这条隧道收尾。补一条 ProxyEnd。
         if self.session.peer_closed() && !self.tunnel_closed {
@@ -565,6 +557,49 @@ impl InstallRunner {
                 format!("出错了：{}", self.error.as_deref().unwrap_or("未知原因"))
             }
         }
+    }
+}
+
+/// 单条代理消息里最多放多少字节的 TLS 数据。
+///
+/// ⚠️⚠️ **这个上限是必须的，超了相机会直接中止安装。**
+///
+/// 真机实测：相机对一个"声明了 2,850,108 字节"的代理消息回了
+/// `0xA809（数据过多）`，安装就此中断。而 147 KB 的响应能正常发完 ——
+/// 说明上限在两者之间。当时的日志停在
+/// `[HTTPS] → 回复 200 2850108 字节` 之后就没了，现象是"卡在下载那一步"。
+///
+/// 取 `2^14 = 16384` 是照抄原项目：它每轮从套接字 `sock.recv(2 ** 14)`，
+/// 最多就写这么多 —— 这是**已经被验证能用**的值。
+///
+/// 每条消息自带 `[fd][长度]` 头（见 `Outgoing::ProxyData` 的编码），
+/// 所以切成多条是合法的：相机按每条消息自己的长度头解析。
+const MAX_PROXY_DATA_PER_MESSAGE: usize = 16384;
+
+/// 把一段 TLS 数据排进发送队列，**必要时切成多条代理消息**。
+///
+/// 别绕过这个函数直接 push `Outgoing::ProxyData` —— 一旦数据超过上限，
+/// 真机上就会炸成 `0xA809`，而且现象是"装到下载那一步就不动了"，
+/// 很难联想到是消息大小的问题。
+fn push_proxy_data(outgoing: &mut Vec<crate::proxy::ProxyMessage>, socket_fd: i32, data: &[u8]) {
+    if data.is_empty() {
+        return;
+    }
+    let count = data.len().div_ceil(MAX_PROXY_DATA_PER_MESSAGE);
+    if count > 1 {
+        trace_diag(&format!(
+            "[隧道] {} 字节要回给相机，拆成 {count} 条消息（每条最多 {MAX_PROXY_DATA_PER_MESSAGE} 字节）",
+            data.len()
+        ));
+    }
+    for chunk in data.chunks(MAX_PROXY_DATA_PER_MESSAGE) {
+        outgoing.push(
+            Outgoing::ProxyData {
+                socket_fd,
+                data: chunk.to_vec(),
+            }
+            .encode(),
+        );
     }
 }
 
@@ -835,6 +870,67 @@ mod tests {
         r.poll(ProxyMessage::new(sony::MSG_REST, payload)).unwrap();
         assert!(r.take_outgoing().is_empty(), "接受后不该再发东西");
         assert_eq!(r.phase(), InstallPhase::Running, "不该变成失败");
+    }
+
+    /// ⚠️ 回归测试：大的 TLS 响应**必须被切成多条代理消息**。
+    ///
+    /// 真机上曾把 2.85 MB 的 SPK 响应塞进一条消息，头部声明
+    /// `dataSize = 2850108`，相机回 `0xA809（数据过多）`，安装就此中断 ——
+    /// 日志停在"回复 200 2850108 字节"之后再无动静。这个测试盯住上限。
+    #[test]
+    fn large_tls_reply_is_split_into_bounded_messages() {
+        const REAL_FAILURE_SIZE: usize = 2_850_108; // 真机失败时的实际字节数
+        let big = vec![0xABu8; REAL_FAILURE_SIZE];
+
+        let mut outgoing = Vec::new();
+        push_proxy_data(&mut outgoing, 4, &big);
+
+        assert!(
+            outgoing.len() > 1,
+            "2.85 MB 必须被拆开，实际只排了 {} 条消息",
+            outgoing.len()
+        );
+
+        // 每条消息都得能解析出来，而且声明的长度不能超过上限
+        let mut total = 0usize;
+        for (i, msg) in outgoing.iter().enumerate() {
+            let (sub_type, payload) =
+                sony::parse_common(&msg.payload).expect("消息应当能解析");
+            assert_eq!(sub_type, sony::TCP_PROXY_DATA, "第 {i} 条的类型不对");
+
+            // 载荷 = [fd: 4][长度: 4][数据]
+            let fd = i32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+            assert_eq!(fd, 4, "第 {i} 条的 tunnel fd 不对");
+            let size =
+                u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]) as usize;
+            assert!(
+                size <= MAX_PROXY_DATA_PER_MESSAGE,
+                "第 {i} 条声明了 {size} 字节，超过上限 {MAX_PROXY_DATA_PER_MESSAGE}"
+            );
+            assert_eq!(
+                payload.len() - 8,
+                size,
+                "第 {i} 条：声明的长度和实际数据对不上"
+            );
+            total += size;
+        }
+        assert_eq!(total, REAL_FAILURE_SIZE, "切分不能丢数据");
+    }
+
+    /// 小数据不该被切（避免每条小消息都白拆一次）
+    #[test]
+    fn small_tls_reply_stays_in_one_message() {
+        let mut outgoing = Vec::new();
+        push_proxy_data(&mut outgoing, 7, &[1, 2, 3, 4, 5]);
+        assert_eq!(outgoing.len(), 1, "小数据应当只有一条消息");
+    }
+
+    /// 空数据不该产生消息
+    #[test]
+    fn empty_reply_produces_no_message() {
+        let mut outgoing = Vec::new();
+        push_proxy_data(&mut outgoing, 7, &[]);
+        assert!(outgoing.is_empty(), "空数据不该发消息");
     }
 
     /// 结果码非 0 时 check_result 要报错
