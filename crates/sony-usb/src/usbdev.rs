@@ -297,13 +297,30 @@ pub const MASS_STORAGE_NO_DISK_MESSAGE: &str = "相机现在是「海量存储�
      \n\
      请插一张存储卡，然后把 USB 线拔下来再插上。";
 
+/// 把设备列表排成一行，给**日志**用。
+///
+/// 为什么值得单列一个函数：产品号是排查这类问题唯一靠得住的线索
+/// （"相机插着但看不到"到底是什么模式，就看这个号）。
+/// 之前只把它写进 `install-diag.log`，结果用户报问题时得专门去找那个文件 ——
+/// 真机上就吃过这个亏：用户截了图、点了复制，可里面偏偏没有这一行。
+///
+/// 所以现在把设备摘要**也写进用户能看到的运行日志** ——
+/// 用户点一下「复制」就能把它带出来，不用再去翻文件。
+///
+/// ⚠️ 只进日志，**不要**摆到卡片上：`054C:0AAA` 这种号码对普通用户是噪音。
+pub fn format_device_list(ids: &[UsbId]) -> String {
+    if ids.is_empty() {
+        return "（没有枚举到索尼 USB 设备）".to_string();
+    }
+    ids.iter()
+        .map(|id| format!("{:04X}:{:04X}", id.vendor, id.product))
+        .collect::<Vec<_>>()
+        .join("、")
+}
+
 /// 「MTP 设备存在、但 WPD 看不到」的提示文字
 pub fn not_visible_message(ids: &[UsbId]) -> String {
-    let detail = ids
-        .iter()
-        .map(|id| format!("054C:{:04X}", id.product))
-        .collect::<Vec<_>>()
-        .join("、");
+    let detail = format_device_list(ids);
     format!(
         "相机插着、也是 MTP 模式，但 Windows 的「便携设备」列表里没有它。\n\
          设备：{detail}\n\

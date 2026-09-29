@@ -379,6 +379,8 @@ impl App {
             WorkerMsg::Camera(Ok(probe)) => {
                 use sony_install::CameraProbe as P;
                 let detail = probe.detail().unwrap_or_default();
+                // 排查用的设备摘要（可能为空），只写进日志
+                let devices = probe.devices_hint().unwrap_or("（无）").to_string();
                 match probe {
                     P::Ready(status) => {
                         self.push_log(
@@ -400,14 +402,24 @@ impl App {
                         self.camera = Camera::MassStorage(model);
                     }
                     P::ModeUnknown(_) => {
+                        // ⚠️ 设备号一定要写进**运行日志**：用户报问题时点一下
+                        //    「复制」就能带出来。之前只写在 install-diag.log 里，
+                        //    结果用户截了图、点了复制，偏偏没有这行关键信息。
                         self.push_log(
                             Level::Warn,
-                            "相机插着，但 Windows 看不到它，也认不出是什么连接方式",
+                            format!(
+                                "相机插着，但 Windows 看不到它，也认不出是什么连接方式（设备：{devices}）"
+                            ),
                         );
                         self.camera = Camera::ModeUnknown(detail);
                     }
                     P::MassStorageNoDisk(_) => {
-                        self.push_log(Level::Warn, "相机在海量存储器模式，但没看到磁盘（可能没插存储卡）");
+                        self.push_log(
+                            Level::Warn,
+                            format!(
+                                "相机在海量存储器模式，但没看到磁盘（可能没插存储卡）（设备：{devices}）"
+                            ),
+                        );
                         self.camera = Camera::MassStorageNoDisk(detail);
                     }
                     P::Unreadable(msg) => {
@@ -1029,12 +1041,16 @@ mod tests {
     /// 因为他那台机器的产品号不在我们那张（只在 α6300 上测过的）清单里。
     #[test]
     fn unknown_mode_does_not_tell_the_user_to_switch_to_mtp() {
+        let unseen = || sony_install::UnseenCamera {
+            message: "某某说明".to_string(),
+            devices: "054C:1234".to_string(),
+        };
         let mut a = app();
         a.on_worker(WorkerMsg::Camera(Ok(sony_install::CameraProbe::ModeUnknown(
-            "某某说明".to_string(),
+            unseen(),
         ))));
 
-        let title = sony_install::CameraProbe::ModeUnknown(String::new()).title();
+        let title = sony_install::CameraProbe::ModeUnknown(unseen()).title();
         assert!(
             !title.contains("改成 MTP"),
             "我们并不知道它是不是 MTP，标题不能替用户下结论：{title}"
@@ -1046,12 +1062,23 @@ mod tests {
             Camera::ModeUnknown(_) => {}
             other => panic!("应进「认不出模式」状态，实际 {other:?}"),
         }
+
+        // 产品号必须落进**运行日志** —— 用户点「复制」就能带出来。
+        // 真机上就是缺了这一行，才没法确认 α6000 的产品号。
+        assert!(
+            a.log_lines().any(|l| l.contains("054C:1234")),
+            "设备号要写进运行日志，否则用户没法把它发给我们"
+        );
     }
 
     /// 已知海量存储器型号但没看到磁盘 → 标题要指向存储卡
     #[test]
     fn mass_storage_without_disk_points_at_the_card() {
-        let title = sony_install::CameraProbe::MassStorageNoDisk(String::new()).title();
+        let title = sony_install::CameraProbe::MassStorageNoDisk(sony_install::UnseenCamera {
+            message: String::new(),
+            devices: String::new(),
+        })
+        .title();
         assert!(title.contains("存储卡"), "要指向存储卡：{title}");
     }
 

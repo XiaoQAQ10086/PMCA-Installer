@@ -96,10 +96,10 @@ pub enum CameraProbe {
     /// ⚠️ 这种情况**不能**断言"模式不对"。我们只在 ILCE-6300 上实测过产品号，
     /// 别的机型对不上很正常 —— 旧版就是因此对着一个**明明选了 MTP** 的
     /// α6000 喊"请把相机改成 MTP 模式"。
-    ModeUnknown(String),
+    ModeUnknown(UnseenCamera),
     /// 相机是已知的「海量存储器」型号，但 Windows 没看到它的磁盘
     /// （最常见：相机里没插存储卡）
-    MassStorageNoDisk(String),
+    MassStorageNoDisk(UnseenCamera),
     /// 插着索尼设备，但读不出设备信息（被别的程序占用 / 驱动问题）
     Unreadable(String),
     /// 没插相机
@@ -130,11 +130,22 @@ impl CameraProbe {
             CameraProbe::MassStorage { model } => Some(format!(
                 "{model} · 这种机型就要用这个模式，安装时会自动切换，不用你去改相机设置"
             )),
-            CameraProbe::ModeUnknown(msg) | CameraProbe::MassStorageNoDisk(msg) => {
-                Some(msg.clone())
+            CameraProbe::ModeUnknown(u) | CameraProbe::MassStorageNoDisk(u) => {
+                Some(u.message.clone())
             }
             CameraProbe::Unreadable(msg) => Some(msg.clone()),
             CameraProbe::NotFound => None,
+        }
+    }
+
+    /// 排查用的设备摘要 —— **只写进运行日志，不要摆到卡片上**。
+    ///
+    /// 用户点「复制」时会把它一起带出来，这样报问题时我们就能看到
+    /// 相机的产品号，不用再让他去找 `install-diag.log`。
+    pub fn devices_hint(&self) -> Option<&str> {
+        match self {
+            CameraProbe::ModeUnknown(u) | CameraProbe::MassStorageNoDisk(u) => Some(&u.devices),
+            _ => None,
         }
     }
 
@@ -145,6 +156,23 @@ impl CameraProbe {
             CameraProbe::Ready(_) | CameraProbe::MassStorage { .. }
         )
     }
+}
+
+/// 「相机插着但 Windows 看不到」这类状态的详情
+///
+/// 分成两半是有意的：
+/// - `message` 摆到卡片上给用户看，只说该怎么做
+/// - `devices` **只写进运行日志**，是排查用的（`054C:0AAA` 这种号码
+///   对普通用户是噪音，但报问题时没有它我们就抓瞎）
+///
+/// 真机上吃过这个亏：用户截了图、还点了「复制」，可里面偏偏没有产品号 ——
+/// 因为那时候它只写在 `install-diag.log` 文件里。
+#[derive(Debug, Clone)]
+pub struct UnseenCamera {
+    /// 卡片上给用户看的说明
+    pub message: String,
+    /// 排查用的设备摘要（只进日志）
+    pub devices: String,
 }
 
 /// 安装过程中往外报告的事件
@@ -292,26 +320,26 @@ fn classify_absent_camera() -> CameraProbe {
     }
 
     let ids = sony_usb::usbdev::list_usb_ids_of_vendor(sony_usb::SONY_VENDOR_ID);
-    // 设备号这类排查信息记进诊断日志，不摆到界面上
-    if !ids.is_empty() {
-        sony_core::market::trace_diag(&format!(
-            "[设备] WPD 看不到相机，但从 USB 枚举到的索尼设备：{}",
-            ids.iter()
-                .map(|i| format!("{:04X}:{:04X}", i.vendor, i.product))
-                .collect::<Vec<_>>()
-                .join("、")
-        ));
-    }
+    let devices = sony_usb::usbdev::format_device_list(&ids);
+    // 设备号既进诊断日志（完整记录），也带给界面写进运行日志 ——
+    // 后者是为了让用户点一下「复制」就能把产品号发给我们，不用去翻文件
+    sony_core::market::trace_diag(&format!(
+        "[设备] WPD 看不到相机，但从 USB 枚举到的索尼设备：{devices}"
+    ));
     match sony_usb::usbdev::classify(&ids) {
         sony_usb::usbdev::Presence::None => CameraProbe::NotFound,
         // ⚠️ 产品号不认识时**不能**说"模式不对" —— 见 `CameraProbe::ModeUnknown`
         //    上的说明。这里如实转达"我们认不出来"，并把两种连接方式都给用户。
-        sony_usb::usbdev::Presence::UnknownMode => {
-            CameraProbe::ModeUnknown(sony_usb::usbdev::UNKNOWN_MODE_MESSAGE.to_string())
+        sony_usb::usbdev::Presence::UnknownMode => CameraProbe::ModeUnknown(UnseenCamera {
+            message: sony_usb::usbdev::UNKNOWN_MODE_MESSAGE.to_string(),
+            devices,
+        }),
+        sony_usb::usbdev::Presence::MassStorageNoDisk => {
+            CameraProbe::MassStorageNoDisk(UnseenCamera {
+                message: sony_usb::usbdev::MASS_STORAGE_NO_DISK_MESSAGE.to_string(),
+                devices,
+            })
         }
-        sony_usb::usbdev::Presence::MassStorageNoDisk => CameraProbe::MassStorageNoDisk(
-            sony_usb::usbdev::MASS_STORAGE_NO_DISK_MESSAGE.to_string(),
-        ),
         sony_usb::usbdev::Presence::NotVisible => {
             CameraProbe::Unreadable(sony_usb::usbdev::not_visible_message(&ids))
         }
