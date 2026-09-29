@@ -41,14 +41,13 @@
 
 ### 为什么有些机型装不了
 
-装应用的前提是**相机跑的是 Android 系统** —— PlayMemories 的应用就是普通的
+装应用的前提是相机跑的是 Android 系统 —— PlayMemories 的应用就是普通的
 Android 应用（APK），得有个 Android 在底下才能跑。
 
-索尼后来把相机的系统从 **Android 换成了 Linux**（Android 启动太慢），
-那些机型就没有应用商店了，自然也就装不了 APK。
+索尼后来把相机的系统从 Android 换成了 Linux（Android 启动太慢），
+新机型自然没有应用商店，也就装不了 APK。
 
-所以**不能按"新旧"或"贵不贵"猜**，想看自己的相机行不行，
-查[官方机型表](https://openmemories.readthedocs.io/devices.html)最准。
+所以想看自己的相机行不行，查[官方机型表](https://openmemories.readthedocs.io/devices.html)最准。
 
 ### 相机怎么连，程序自己搞定
 
