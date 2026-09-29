@@ -14,6 +14,7 @@
 use std::sync::mpsc::{Receiver, TryRecvError};
 
 use iced::widget::{
+    canvas,
     Space, button, column, container, progress_bar, row, scrollable, space, stack, text,
 };
 use iced::{Alignment, Element, Length, Task};
@@ -212,6 +213,8 @@ pub enum Message {
     RunDownloaded(std::path::PathBuf),
     /// 用浏览器打开发布页（拿不到直链时的退路）
     OpenReleasePage(String),
+    /// 用浏览器打开作者的某个链接（网盘 / 抖音 / B站）
+    OpenBrand(crate::brand::Brand),
     /// 用户把文件拖进了窗口
     ApkDropped(std::path::PathBuf),
     /// 不关心的窗口事件（定位、缩放等），什么都不做
@@ -496,6 +499,10 @@ impl App {
                 }
             }
             Message::OpenReleasePage(url) => open_in_browser(&url),
+            Message::OpenBrand(brand) => {
+                self.push_log(Level::Info, format!("打开{}：{}", brand.label(), brand.url()));
+                open_in_browser(brand.url());
+            }
             Message::StartDownload => self.begin_download(),
             Message::CancelDownload => {
                 // 把旗子立起来，下载线程下一块数据就会停下
@@ -1031,8 +1038,43 @@ impl App {
     }
 
 
-    /// 右上角那颗「检查更新」按钮。
+    /// 作者链接的三个按钮（图标 + 文字）
     ///
+    /// 放在「检查更新」左边。用各家自己的品牌色画图标 ——
+    /// 这样即使不认识字，也能一眼看出哪个是抖音、哪个是 B 站。
+    fn brand_buttons(&self) -> Element<'_, Message> {
+        let mut bar = row![].spacing(6).align_y(Alignment::Center);
+        for brand in crate::brand::Brand::ALL {
+            bar = bar.push(self.brand_button(brand));
+        }
+        bar.into()
+    }
+
+    /// 单个作者链接按钮
+    fn brand_button(&self, brand: crate::brand::Brand) -> Element<'_, Message> {
+        // 图标是**用代码画的**（见 brand.rs），不依赖任何图片文件
+        let icon = canvas(crate::brand::Icon::new(brand))
+            .width(Length::Fixed(14.0))
+            .height(Length::Fixed(14.0));
+
+        let content = row![
+            icon,
+            text(brand.label())
+                .size(th::SIZE_CAPTION)
+                .font(self.fonts.regular)
+                .color(th::TEXT),
+        ]
+        .spacing(5)
+        .align_y(Alignment::Center);
+
+        button(content)
+            .padding([3, 8])
+            .style(th::secondary_button)
+            .on_press(Message::OpenBrand(brand))
+            .into()
+    }
+
+    /// 右上角那颗「检查更新」按钮。
     /// 三种样子，取决于查到了什么：
     /// - 平时：「检查更新」，点一下再查
     /// - 查不动：「检查更新」，让用户能重试（查失败不摆脸色）
@@ -1078,6 +1120,7 @@ impl App {
                 .font(self.fonts.bold)
                 .color(th::TEXT),
             space::horizontal(),
+            self.brand_buttons(),
             update_button,
             text(format!("v{}", crate::VERSION))
                 .size(th::SIZE_CAPTION)

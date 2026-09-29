@@ -34,6 +34,10 @@ iced = { version = "0.14", default-features = false, features = [
     "crisp",
     "web-colors",
     "smol",
+    # 作者链接的小图标是**用代码画**的（见 src/brand.rs）。
+    # 开这个是为了 canvas，它只依赖 tiny-skia 自己的路径 API ——
+    # 换成图片或 SVG 分别要拉进 image 解码库和 resvg，都不划算。
+    "canvas",
 ] }
 
 # 原生「打开文件」对话框
