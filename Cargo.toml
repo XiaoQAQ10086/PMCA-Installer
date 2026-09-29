@@ -49,6 +49,12 @@ features = [
     "Win32_Security",
     # DRIVE_REMOVABLE 在这个模块里
     "Win32_System_WindowsProgramming",
+    # 检查更新：用 Windows 自带的 WinHTTP 发 HTTPS 请求。
+    # 特意不引入 ureq/reqwest 之类的库 —— 那会把整套 TLS 实现编进去，
+    # exe 体积要涨一两 MB，而系统本来就有一套现成的。
+    "Win32_Networking_WinHttp",
+    # ShellExecuteW：点"有新版本"时打开浏览器
+    "Win32_UI_Shell",
 ]
 
 [profile.release]

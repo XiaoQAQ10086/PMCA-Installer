@@ -38,3 +38,8 @@ iced = { version = "0.14", default-features = false, features = [
 
 # 原生「打开文件」对话框
 rfd = "0.15"
+
+# 检查更新用系统自带的 WinHTTP（见 src/update.rs），
+# 另外用 ShellExecuteW 打开浏览器
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true

@@ -107,6 +107,46 @@ pub struct App {
     /// 安装成功后相机回报的完整信息
     report: Option<String>,
     font_status: FontStatus,
+    /// 检查更新的状态
+    update: UpdateState,
+    /// 检查更新线程的消息
+    update_rx: Option<Receiver<WorkerMsg>>,
+}
+
+/// 检查更新的状态
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpdateState {
+    /// 还没查过
+    Idle,
+    /// 正在查
+    Checking,
+    /// 已是最新
+    UpToDate,
+    /// 有新版本可用
+    Available {
+        version: String,
+        url: String,
+    },
+    /// 没查成。
+    ///
+    /// ⚠️ 原因留着只给日志用，**界面上不要拿它吓唬用户** ——
+    /// 没网、被墙、公司内网拦了，都是很正常的处境，
+    /// 一个装应用的小工具不该因此摆个红叉。
+    Failed(String),
+}
+
+impl UpdateState {
+    /// 右上角那颗按钮上写什么
+    fn label(&self) -> String {
+        match self {
+            UpdateState::Idle => "检查更新".to_string(),
+            UpdateState::Checking => "检查中…".to_string(),
+            UpdateState::UpToDate => "已是最新".to_string(),
+            UpdateState::Available { version, .. } => format!("有新版本 v{version}"),
+            // 查失败时按钮回到"检查更新"，让用户能再点一次
+            UpdateState::Failed(_) => "检查更新".to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -123,6 +163,10 @@ pub enum Message {
     ClearLog,
     /// 把运行日志复制到剪贴板
     CopyLog,
+    /// 检查有没有新版本
+    CheckUpdate,
+    /// 打开新版本的下载页
+    OpenReleasePage(String),
     /// 用户把文件拖进了窗口
     ApkDropped(std::path::PathBuf),
     /// 不关心的窗口事件（定位、缩放等），什么都不做
@@ -142,6 +186,8 @@ impl App {
             rx: None,
             pick_rx: None,
             report: None,
+            update: UpdateState::Idle,
+            update_rx: None,
             font_status,
         };
         match font_status {
@@ -171,6 +217,17 @@ impl App {
     /// 启动时立即检测一次相机
     pub fn boot_task(&mut self) {
         self.begin_check();
+        // 启动时**自动**查一次有没有新版本。
+        //
+        // 放在后台线程里，绝不挡住启动 —— 网络慢的时候它会自己慢慢查，
+        // 界面早就显示出来了，查到了再更新右上角那颗按钮。
+        self.begin_update_check();
+    }
+
+    /// 开始查更新（在后台线程里跑）
+    fn begin_update_check(&mut self) {
+        self.update = UpdateState::Checking;
+        self.update_rx = Some(worker::spawn_update_check(crate::VERSION.to_string()));
     }
 
     /// 预选一个应用包（命令行参数传进来的）
@@ -306,6 +363,12 @@ impl App {
                     self.accept_apk(path);
                 }
             }
+            Message::CheckUpdate => {
+                if self.update != UpdateState::Checking {
+                    self.begin_update_check();
+                }
+            }
+            Message::OpenReleasePage(url) => open_in_browser(&url),
             Message::Tick => self.drain_workers(),
             Message::Ignored => {}
         }
@@ -345,6 +408,29 @@ impl App {
                 self.accept_apk(choice.path);
             }
         }
+        // ---- 检查更新线程 ----
+        //
+        // 和上面两条一样用 try_recv 轮询，不阻塞。
+        // 单独一条通道是因为它跟相机、安装都没关系，
+        // 而且它可能在"正在安装"的时候才回来，不该被安装流程的
+        // 状态管理牵扯进去。
+        let mut update_msg = None;
+        if let Some(rx) = &self.update_rx {
+            match rx.try_recv() {
+                Ok(m) => update_msg = Some(m),
+                Err(TryRecvError::Empty) => {}
+                // 线程没了却什么都没发（极罕见）→ 当作查失败，别永远停在"检查中…"
+                Err(TryRecvError::Disconnected) => {
+                    update_msg = Some(WorkerMsg::Update(crate::update::UpdateCheck::Failed(
+                        "检查线程意外退出".to_string(),
+                    )));
+                }
+            }
+        }
+        if let Some(msg) = update_msg {
+            self.update_rx = None;
+            self.on_worker(msg);
+        }
         // ---- 相机 / 安装线程 ----
         let mut msgs = Vec::new();
         let mut disconnected = false;
@@ -370,6 +456,30 @@ impl App {
                 self.stage = Stage::Failed;
                 self.status = "操作意外中断（后台线程已退出）".into();
                 self.push_log(Level::Bad, "操作意外中断：后台线程已退出");
+            }
+        }
+    }
+
+    /// 检查更新的结果回来了
+    fn on_update(&mut self, result: crate::update::UpdateCheck) {
+        use crate::update::UpdateCheck as U;
+        match result {
+            U::Available { version, url } => {
+                self.push_log(
+                    Level::Good,
+                    format!("发现新版本 v{version} —— 点右上角「有新版本」去下载"),
+                );
+                self.update = UpdateState::Available { version, url };
+            }
+            U::UpToDate { latest } => {
+                self.push_log(Level::Info, format!("已是最新版本（{latest}）"));
+                self.update = UpdateState::UpToDate;
+            }
+            U::Failed(why) => {
+                // ⚠️ 查不到更新**不是错误**：用户可能没网、可能在内网、
+                //    也可能只是代理慢。日志里记一句就够，界面上不摆红字。
+                self.push_log(Level::Info, format!("检查更新失败（不影响使用）：{why}"));
+                self.update = UpdateState::Failed(why);
             }
         }
     }
@@ -438,6 +548,7 @@ impl App {
                 self.push_log(Level::Bad, format!("检测相机失败：{e}"));
                 self.camera = Camera::Missing(e);
             }
+            WorkerMsg::Update(result) => self.on_update(result),
             WorkerMsg::Step(s) => {
                 self.push_log(Level::Info, &s);
                 if self.stage == Stage::Preparing {
@@ -532,21 +643,64 @@ impl App {
             .into()
     }
 
+    /// 右上角那颗「检查更新」按钮。
+    ///
+    /// 三种样子，取决于查到了什么：
+    /// - 平时：「检查更新」，点一下再查
+    /// - 查不动：「检查更新」，让用户能重试（查失败不摆脸色）
+    /// - 有新版本：变成醒目的「有新版本 v1.0.5」，点一下打开下载页
+    fn update_button(&self) -> Element<'_, Message> {
+        let label = self.update.label();
+        let has_news = matches!(self.update, UpdateState::Available { .. });
+        let checking = self.update == UpdateState::Checking;
+
+        let text_widget = text(label)
+            .size(th::SIZE_CAPTION)
+            .font(if has_news {
+                self.fonts.bold
+            } else {
+                self.fonts.regular
+            });
+
+        let button = button(text_widget).padding([3, 10]);
+
+        if has_news {
+            // 有新版本：强调色 + 点开下载页
+            let url = match &self.update {
+                UpdateState::Available { url, .. } => url.clone(),
+                _ => String::new(),
+            };
+            return button
+                .style(th::primary_button)
+                .on_press(Message::OpenReleasePage(url))
+                .into();
+        }
+
+        button
+            .style(th::secondary_button)
+            // 正在查的时候禁用，免得连点几下开出一堆线程
+            .on_press_maybe((!checking).then_some(Message::CheckUpdate))
+            .into()
+    }
     /// 顶部标题
     fn header(&self) -> Element<'_, Message> {
-        // 标题行：软件名 + 右上角的版本号
+        // 标题行：软件名 + 右上角的「检查更新」和版本号
+        let update_button = self.update_button();
+
         let title_row = row![
             text("PMCA 安装器")
                 .size(th::SIZE_TITLE)
                 .font(self.fonts.bold)
                 .color(th::TEXT),
             space::horizontal(),
+            update_button,
             text(format!("v{}", crate::VERSION))
                 .size(th::SIZE_CAPTION)
                 .font(self.fonts.regular)
                 .color(th::TEXT_FAINT),
         ]
-        .align_y(Alignment::End);
+        .align_y(Alignment::Center)
+        .spacing(8);
 
         let mut col = column![
             title_row,
@@ -916,6 +1070,43 @@ fn summarize(json: &str) -> String {
     let fw = v["deviceinfo"]["fwversion"].as_str().unwrap_or("?");
     let count = v["applications"].as_array().map(|a| a.len()).unwrap_or(0);
     format!("型号 {model}，固件 {fw}，已安装 {count} 个应用")
+}
+
+// ---------------------------------------------------------------- 系统交互
+
+/// 用默认浏览器打开一个网址。
+///
+/// 用 `ShellExecuteW` 而不是自己起进程：它会交给系统的 URL 关联处理，
+/// 用户装的是什么浏览器就用什么，而且不用管参数转义。
+///
+/// 失败就记一句日志 —— 打不开浏览器只是小事，不该影响别的功能。
+fn open_in_browser(url: &str) {
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+
+    let op = to_wide("open");
+    let file = to_wide(url);
+    // SW_SHOWNORMAL = 1
+    let result = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            op.as_ptr(),
+            file.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            1,
+        )
+    };
+    // ShellExecuteW 的返回值 > 32 才算成功（这是它的历史约定，不是错误码）
+    if (result as isize) <= 32 {
+        // 打不开浏览器只是小事，写进诊断日志就够了，不打扰用户
+        sony_core::market::trace_diag(&format!(
+            "[更新] 打开浏览器失败（ShellExecuteW 返回 {result:p}）"
+        ));
+    }
+}
+
+fn to_wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 #[cfg(test)]

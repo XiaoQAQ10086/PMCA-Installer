@@ -84,6 +84,8 @@ pub enum WorkerMsg {
     Progress { percent: u8, text: String },
     /// 安装结束：成功给结果，失败给原因
     Finished(Result<InstallOutcome, String>),
+    /// 检查更新的结果
+    Update(crate::update::UpdateCheck),
 }
 
 /// 检测相机（**不改变**相机状态）。返回一个可以轮询的接收端。
@@ -94,6 +96,23 @@ pub fn spawn_probe() -> Receiver<WorkerMsg> {
         .spawn(move || {
             let result = sony_install::probe_camera().map_err(|e| format!("{e:#}"));
             let _ = tx.send(WorkerMsg::Camera(result));
+        });
+    rx
+}
+
+/// 查一次有没有新版本。
+///
+/// ⚠️ 必须放在后台线程：网络不好的时候会卡好几秒到十几秒
+/// （DNS 慢、代理慢、连不上要等超时），放在界面线程上窗口直接卡死。
+///
+/// `current` 是本程序的版本号，用来跟服务器上的比。
+pub fn spawn_update_check(current: String) -> Receiver<WorkerMsg> {
+    let (tx, rx) = channel();
+    let _ = std::thread::Builder::new()
+        .name("检查更新".into())
+        .spawn(move || {
+            let result = crate::update::check(&current);
+            let _ = tx.send(WorkerMsg::Update(result));
         });
     rx
 }
