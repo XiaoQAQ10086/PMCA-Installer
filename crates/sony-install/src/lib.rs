@@ -471,7 +471,8 @@ pub fn find_and_prepare_camera(report: Reporter) -> Result<CameraStatus> {
              这种模式下本工具能自己把它切到安装模式，不用你再做别的。）\n\
              \n\
              如果改成海量存储器后仍然不行，那说明这台相机确实不支持安装应用 ——\n\
-             较新的机型（比如 α7 III）出厂就没有这个功能。\n\
+             索尼后来把相机的系统从 Android 换成了 Linux，那些机型没有应用商店，\n\
+             也就跑不了 APK（比如 α7 III）。\n\
              \n\
              相机报告的操作码：{}",
             info.model,

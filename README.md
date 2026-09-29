@@ -39,16 +39,16 @@
 - NEX-5R / NEX-5T / NEX-6
 - 部分 DSC 和 Handycam（HDR-CX675、FDR-AX53 …）
 
-### ⚠️ 不能按"新旧"判断
+### 为什么有些机型装不了
 
-| 机型 | 年份 | 能不能装 |
-|---|---|---|
-| α6000 | 2014 | ✅ 能 |
-| α6300 | 2016 | ✅ 能 |
-| **α7 III** | **2018** | ❌ **不能** |
+装应用的前提是**相机跑的是 Android 系统** —— PlayMemories 的应用就是普通的
+Android 应用（APK），得有个 Android 在底下才能跑。
 
-α7 III 比 α6000 新 4 年，**反而不能装**——索尼后来把这个功能砍掉了。
-所以想看自己的相机行不行，得查[官方机型表](https://openmemories.readthedocs.io/devices.html)。
+索尼后来把相机的系统从 **Android 换成了 Linux**（Android 启动太慢），
+那些机型就没有应用商店了，自然也就装不了 APK。
+
+所以**不能按"新旧"或"贵不贵"猜**，想看自己的相机行不行，
+查[官方机型表](https://openmemories.readthedocs.io/devices.html)最准。
 
 ### 相机怎么连，程序自己搞定
 
