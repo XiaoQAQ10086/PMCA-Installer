@@ -83,6 +83,17 @@ pub fn theme() -> Theme {
 // ---------------------------------------------------------------- 容器样式
 
 /// 窗口根容器：铺满底色
+/// 对话框背后的半透明遮罩。
+///
+/// 用半透明黑而不是纯色：底下的界面还看得见，用户知道"主界面还在，
+/// 只是现在被这个对话框挡住了"，不会以为程序跳到别处去了。
+pub fn scrim(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Color { a: 0.45, ..Color::BLACK }.into()),
+        ..container::Style::default()
+    }
+}
+
 pub fn root(_theme: &Theme) -> container::Style {
     container::Style {
         background: Some(Background::Color(WINDOW_BG)),

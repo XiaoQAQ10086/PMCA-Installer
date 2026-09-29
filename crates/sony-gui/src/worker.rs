@@ -86,6 +86,10 @@ pub enum WorkerMsg {
     Finished(Result<InstallOutcome, String>),
     /// 检查更新的结果
     Update(crate::update::UpdateCheck),
+    /// 下载进度
+    DownloadProgress(crate::update::Progress),
+    /// 下载结束
+    DownloadDone(crate::update::DownloadOutcome),
 }
 
 /// 检测相机（**不改变**相机状态）。返回一个可以轮询的接收端。
@@ -117,6 +121,31 @@ pub fn spawn_update_check(current: String) -> Receiver<WorkerMsg> {
     rx
 }
 
+/// 下载新版本的安装包。
+///
+/// `cancel` 是界面和这个线程共享的旗子 —— 用户点「取消下载」时界面把它置起来，
+/// 下载循环下一块数据就会停，**并且把没下完的半截文件删掉**。
+///
+/// 进度回调故意做成"合并上报"：`update::download` 内部按固定间隔才回调一次，
+/// 免得每秒几百条消息把界面线程淹掉。
+pub fn spawn_download(
+    url: String,
+    dest: std::path::PathBuf,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Receiver<WorkerMsg> {
+    let (tx, rx) = channel();
+    let _ = std::thread::Builder::new()
+        .name("下载更新".into())
+        .spawn(move || {
+            let tx_progress = tx.clone();
+            let mut report = move |p: crate::update::Progress| {
+                let _ = tx_progress.send(WorkerMsg::DownloadProgress(p));
+            };
+            let outcome = crate::update::download(&url, &dest, &cancel, &mut report);
+            let _ = tx.send(WorkerMsg::DownloadDone(outcome));
+        });
+    rx
+}
 /// 开始安装。安装过程的所有进展都会通过返回的接收端送出来。
 pub fn spawn_install(apk: Vec<u8>, app_name: String) -> Receiver<WorkerMsg> {
     let (tx, rx) = channel();

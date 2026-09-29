@@ -13,7 +13,9 @@
 
 use std::sync::mpsc::{Receiver, TryRecvError};
 
-use iced::widget::{Space, button, column, container, progress_bar, row, scrollable, space, text};
+use iced::widget::{
+    Space, button, column, container, progress_bar, row, scrollable, space, stack, text,
+};
 use iced::{Alignment, Element, Length, Task};
 
 use crate::fonts::Fonts;
@@ -111,6 +113,12 @@ pub struct App {
     update: UpdateState,
     /// 检查更新线程的消息
     update_rx: Option<Receiver<WorkerMsg>>,
+    /// 下载新版本的状态
+    download: DownloadState,
+    /// 下载线程的消息
+    download_rx: Option<Receiver<WorkerMsg>>,
+    /// 取消下载用的旗子（和下载线程共享）
+    download_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// 检查更新的状态
@@ -123,10 +131,7 @@ pub enum UpdateState {
     /// 已是最新
     UpToDate,
     /// 有新版本可用
-    Available {
-        version: String,
-        url: String,
-    },
+    Available(crate::update::NewVersion),
     /// 没查成。
     ///
     /// ⚠️ 原因留着只给日志用，**界面上不要拿它吓唬用户** ——
@@ -142,10 +147,40 @@ impl UpdateState {
             UpdateState::Idle => "检查更新".to_string(),
             UpdateState::Checking => "检查中…".to_string(),
             UpdateState::UpToDate => "已是最新".to_string(),
-            UpdateState::Available { version, .. } => format!("有新版本 v{version}"),
+            UpdateState::Available(nv) => format!("有新版本 v{}", nv.version),
             // 查失败时按钮回到"检查更新"，让用户能再点一次
             UpdateState::Failed(_) => "检查更新".to_string(),
         }
+    }
+}
+
+/// 下载新版本的状态
+///
+/// ⚠️ 和 `UpdateState` 分开：检查是"有没有新版"，下载是"把新版弄到手"，
+/// 两件事的生命周期不一样 —— 下载中途可以重来，检查结果不用动。
+#[derive(Debug, Clone, PartialEq)]
+pub enum DownloadState {
+    /// 没在下载（对话框关着）
+    Idle,
+    /// 正在下载
+    Running(crate::update::Progress),
+    /// 下载完成，文件已经躺在那儿了
+    Done(std::path::PathBuf),
+    /// 用户点了取消 —— 半截文件已经删掉了
+    Cancelled,
+    /// 下载失败
+    Failed(String),
+}
+
+impl DownloadState {
+    /// 对话框是不是开着
+    fn is_open(&self) -> bool {
+        !matches!(self, DownloadState::Idle)
+    }
+
+    /// 现在能不能点「取消下载」
+    fn can_cancel(&self) -> bool {
+        matches!(self, DownloadState::Running(_))
     }
 }
 
@@ -165,7 +200,17 @@ pub enum Message {
     CopyLog,
     /// 检查有没有新版本
     CheckUpdate,
-    /// 打开新版本的下载页
+    /// 开始下载新版本
+    StartDownload,
+    /// 取消下载
+    CancelDownload,
+    /// 关掉下载对话框
+    CloseDownload,
+    /// 打开下载文件所在的文件夹
+    OpenDownloadFolder(std::path::PathBuf),
+    /// 运行刚下载好的新版
+    RunDownloaded(std::path::PathBuf),
+    /// 用浏览器打开发布页（拿不到直链时的退路）
     OpenReleasePage(String),
     /// 用户把文件拖进了窗口
     ApkDropped(std::path::PathBuf),
@@ -188,6 +233,9 @@ impl App {
             report: None,
             update: UpdateState::Idle,
             update_rx: None,
+            download: DownloadState::Idle,
+            download_rx: None,
+            download_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             font_status,
         };
         match font_status {
@@ -228,6 +276,85 @@ impl App {
     fn begin_update_check(&mut self) {
         self.update = UpdateState::Checking;
         self.update_rx = Some(worker::spawn_update_check(crate::VERSION.to_string()));
+    }
+
+    /// 在程序里下载新版本。
+    ///
+    /// 拿不到直链（那个 release 没挂 exe）就退回浏览器 —— 总比什么都不做强。
+    fn begin_download(&mut self) {
+        // ⚠️ 先把要用的东西拷出来，别一边借着 `&self.update` 一边调 `self.push_log`——
+        //    那是同时借不可变和可变，Rust 不让过。
+        let (url, page_url, version, size) = match &self.update {
+            UpdateState::Available(nv) => (
+                nv.download_url.clone(),
+                nv.page_url.clone(),
+                nv.version.clone(),
+                nv.size,
+            ),
+            _ => return,
+        };
+
+        let Some(url) = url else {
+            self.push_log(
+                Level::Warn,
+                "这个版本没有可下载的安装包，改用浏览器打开下载页",
+            );
+            open_in_browser(&page_url);
+            return;
+        };
+
+        let dest = download_destination(&version);
+        // 把上一次的取消旗子清掉，否则新的下载一上来就会被取消
+        self.download_cancel
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+
+        self.push_log(
+            Level::Info,
+            format!("开始下载 v{version} → {}", dest.display()),
+        );
+        self.download = DownloadState::Running(crate::update::Progress {
+            received: 0,
+            // 接口里给了大小就先拿来用，进度条能立刻动起来
+            total: size.unwrap_or(0),
+            speed: 0.0,
+        });
+        self.download_rx = Some(worker::spawn_download(
+            url,
+            dest,
+            self.download_cancel.clone(),
+        ));
+    }
+
+    /// 下载线程报回来的消息
+    fn on_download(&mut self, msg: WorkerMsg) {
+        match msg {
+            WorkerMsg::DownloadProgress(p) => {
+                self.download = DownloadState::Running(p);
+            }
+            WorkerMsg::DownloadDone(outcome) => {
+                self.download_rx = None;
+                match outcome {
+                    crate::update::DownloadOutcome::Done(path) => {
+                        self.push_log(
+                            Level::Good,
+                            format!("下载完成：{}", path.display()),
+                        );
+                        self.download = DownloadState::Done(path);
+                    }
+                    crate::update::DownloadOutcome::Cancelled => {
+                        // 半截文件已经在下载线程里删掉了，这里只说一句
+                        self.push_log(Level::Info, "已取消下载，未完成的文件已删除");
+                        self.download = DownloadState::Cancelled;
+                    }
+                    crate::update::DownloadOutcome::Failed(e) => {
+                        self.push_log(Level::Bad, format!("下载失败：{e}"));
+                        self.download = DownloadState::Failed(e);
+                    }
+                }
+            }
+            // 别的消息不该走到这里
+            _ => {}
+        }
     }
 
     /// 预选一个应用包（命令行参数传进来的）
@@ -369,6 +496,22 @@ impl App {
                 }
             }
             Message::OpenReleasePage(url) => open_in_browser(&url),
+            Message::StartDownload => self.begin_download(),
+            Message::CancelDownload => {
+                // 把旗子立起来，下载线程下一块数据就会停下
+                self.download_cancel
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                self.push_log(Level::Info, "正在取消下载…");
+            }
+            Message::CloseDownload => self.download = DownloadState::Idle,
+            Message::OpenDownloadFolder(path) => reveal_in_explorer(&path),
+            Message::RunDownloaded(path) => match open_executable(&path) {
+                Ok(()) => self.push_log(
+                    Level::Info,
+                    "已启动新版 —— 用完之后可以关掉这个窗口",
+                ),
+                Err(e) => self.push_log(Level::Bad, format!("启动新版失败：{e}")),
+            },
             Message::Tick => self.drain_workers(),
             Message::Ignored => {}
         }
@@ -431,6 +574,32 @@ impl App {
             self.update_rx = None;
             self.on_worker(msg);
         }
+        // ---- 下载线程 ----
+        let mut download_msgs = Vec::new();
+        let mut download_gone = false;
+        if let Some(rx) = &self.download_rx {
+            loop {
+                match rx.try_recv() {
+                    Ok(m) => download_msgs.push(m),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        download_gone = true;
+                        break;
+                    }
+                }
+            }
+        }
+        for m in download_msgs {
+            self.on_download(m);
+        }
+        if download_gone {
+            self.download_rx = None;
+            // 线程没了却还在"下载中" —— 不能让它永远转圈
+            if matches!(self.download, DownloadState::Running(_)) {
+                self.download = DownloadState::Failed("下载线程意外退出".to_string());
+                self.push_log(Level::Bad, "下载意外中断（后台线程已退出）");
+            }
+        }
         // ---- 相机 / 安装线程 ----
         let mut msgs = Vec::new();
         let mut disconnected = false;
@@ -464,12 +633,12 @@ impl App {
     fn on_update(&mut self, result: crate::update::UpdateCheck) {
         use crate::update::UpdateCheck as U;
         match result {
-            U::Available { version, url } => {
+            U::Available(nv) => {
                 self.push_log(
                     Level::Good,
-                    format!("发现新版本 v{version} —— 点右上角「有新版本」去下载"),
+                    format!("发现新版本 v{} —— 点右上角「有新版本」去下载", nv.version),
                 );
-                self.update = UpdateState::Available { version, url };
+                self.update = UpdateState::Available(nv);
             }
             U::UpToDate { latest } => {
                 self.push_log(Level::Info, format!("已是最新版本（{latest}）"));
@@ -549,6 +718,9 @@ impl App {
                 self.camera = Camera::Missing(e);
             }
             WorkerMsg::Update(result) => self.on_update(result),
+            // 下载的消息由 on_download 处理（它自己就是从这个 match 里分出去的）
+            WorkerMsg::DownloadProgress(p) => self.on_download(WorkerMsg::DownloadProgress(p)),
+            WorkerMsg::DownloadDone(outcome) => self.on_download(WorkerMsg::DownloadDone(outcome)),
             WorkerMsg::Step(s) => {
                 self.push_log(Level::Info, &s);
                 if self.stage == Stage::Preparing {
@@ -635,23 +807,241 @@ impl App {
         body = body.push(self.action_card());
         body = body.push(self.log_card());
 
-        container(body)
+        let page = container(body)
             .padding(18)
             .width(Length::Fill)
             .height(Length::Fill)
-            .style(th::root)
+            .style(th::root);
+
+        // 下载对话框要**盖在整页上面**，所以用 stack 把两层叠起来。
+        // 不用单独开一个窗口：那要管理窗口 id、生命周期、位置、关闭事件，
+        // 而我们只是想挡住主界面一会儿。
+        if self.download.is_open() {
+            return stack![page, self.download_dialog()].into();
+        }
+        page.into()
+    }
+
+    /// 下载对话框（盖在主界面上的那一层）
+    ///
+    /// 结构是：半透明遮罩铺满整页 → 中间一张卡片。
+    fn download_dialog(&self) -> Element<'_, Message> {
+        let card_body: Element<'_, Message> = match &self.download {
+            DownloadState::Idle => return Space::new().into(),
+
+            DownloadState::Running(p) => {
+                let amount = if p.total > 0 {
+                    format!(
+                        "{} / {}",
+                        crate::update::human_bytes(p.received),
+                        crate::update::human_bytes(p.total)
+                    )
+                } else {
+                    crate::update::human_bytes(p.received)
+                };
+                // 总量未知时进度条停在 0，下面的文字会说明已下了多少
+                let ratio = if p.total > 0 {
+                    (p.received as f32 / p.total as f32).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+
+                column![
+                    text("正在下载新版")
+                        .size(th::SIZE_HEADING)
+                        .font(self.fonts.bold)
+                        .color(th::TEXT),
+                    text(self.version_line())
+                        .size(th::SIZE_CAPTION)
+                        .font(self.fonts.regular)
+                        .color(th::TEXT_WEAK),
+                    progress_bar(0.0..=1.0, ratio).style(th::progress),
+                    row![
+                        text(amount)
+                            .size(th::SIZE_CAPTION)
+                            .font(self.fonts.regular)
+                            .color(th::TEXT_WEAK),
+                        space::horizontal(),
+                        // 速度单独靠右：下载时这个数字一直在跳，跟总量挤一起会看不清
+                        text(crate::update::human_speed(p.speed))
+                            .size(th::SIZE_CAPTION)
+                            .font(self.fonts.regular)
+                            .color(th::TEXT_FAINT),
+                    ],
+                    row![space::horizontal(), self.cancel_button()],
+                ]
+                .spacing(10)
+                .into()
+            }
+
+            DownloadState::Done(path) => column![
+                text("下载完成")
+                    .size(th::SIZE_HEADING)
+                    .font(self.fonts.bold)
+                    .color(th::SUCCESS),
+                text(self.version_line())
+                    .size(th::SIZE_CAPTION)
+                    .font(self.fonts.regular)
+                    .color(th::TEXT_WEAK),
+                text(format!("已保存到：{}", path.display()))
+                    .size(th::SIZE_CAPTION)
+                    .font(self.fonts.regular)
+                    .color(th::TEXT_FAINT),
+                container(
+                    text("运行新版之后，这个窗口就可以关掉了。")
+                        .size(th::SIZE_CAPTION)
+                        .font(self.fonts.regular)
+                        .color(th::TEXT_WEAK)
+                )
+                .padding(8)
+                .width(Length::Fill)
+                .style(th::inset),
+                row![
+                    space::horizontal(),
+                    button(
+                        text("打开所在文件夹")
+                            .size(th::SIZE_CAPTION)
+                            .font(self.fonts.regular)
+                    )
+                    .padding([5, 12])
+                    .style(th::secondary_button)
+                    .on_press(Message::OpenDownloadFolder(path.clone())),
+                    button(text("运行新版").size(th::SIZE_CAPTION).font(self.fonts.bold))
+                        .padding([5, 12])
+                        .style(th::primary_button)
+                        .on_press(Message::RunDownloaded(path.clone())),
+                    button(
+                        text("关闭")
+                            .size(th::SIZE_CAPTION)
+                            .font(self.fonts.regular)
+                    )
+                    .padding([5, 12])
+                    .style(th::secondary_button)
+                    .on_press(Message::CloseDownload),
+                ]
+                .spacing(8),
+            ]
+            .spacing(10)
+            .into(),
+
+            DownloadState::Cancelled => column![
+                text("已取消下载")
+                    .size(th::SIZE_HEADING)
+                    .font(self.fonts.bold)
+                    .color(th::TEXT),
+                text("没下完的文件已经删掉了，不会在电脑里留下半个安装包。")
+                    .size(th::SIZE_CAPTION)
+                    .font(self.fonts.regular)
+                    .color(th::TEXT_WEAK),
+                row![
+                    space::horizontal(),
+                    button(
+                        text("重新下载")
+                            .size(th::SIZE_CAPTION)
+                            .font(self.fonts.bold)
+                    )
+                    .padding([5, 12])
+                    .style(th::primary_button)
+                    .on_press(Message::StartDownload),
+                    button(
+                        text("关闭")
+                            .size(th::SIZE_CAPTION)
+                            .font(self.fonts.regular)
+                    )
+                    .padding([5, 12])
+                    .style(th::secondary_button)
+                    .on_press(Message::CloseDownload),
+                ]
+                .spacing(8),
+            ]
+            .spacing(10)
+            .into(),
+
+            DownloadState::Failed(why) => column![
+                text("下载失败")
+                    .size(th::SIZE_HEADING)
+                    .font(self.fonts.bold)
+                    .color(th::DANGER),
+                text(why.clone())
+                    .size(th::SIZE_CAPTION)
+                    .font(self.fonts.regular)
+                    .color(th::TEXT_WEAK),
+                text("没下完的文件已经删掉了，可以稍后再试。")
+                    .size(th::SIZE_CAPTION)
+                    .font(self.fonts.regular)
+                    .color(th::TEXT_FAINT),
+                row![
+                    space::horizontal(),
+                    button(text("重试").size(th::SIZE_CAPTION).font(self.fonts.bold))
+                        .padding([5, 12])
+                        .style(th::primary_button)
+                        .on_press(Message::StartDownload),
+                    button(
+                        text("关闭")
+                            .size(th::SIZE_CAPTION)
+                            .font(self.fonts.regular)
+                    )
+                    .padding([5, 12])
+                    .style(th::secondary_button)
+                    .on_press(Message::CloseDownload),
+                ]
+                .spacing(8),
+            ]
+            .spacing(10)
+            .into(),
+        };
+
+        let dialog = container(card_body)
+            .padding(20)
+            .width(Length::Fixed(460.0))
+            .style(th::card);
+
+        // 遮罩铺满整页、半透明，内容居中。
+        // 遮罩本身也吃掉了点击，所以下载时点不到下面的按钮。
+        container(dialog)
+            .padding(40)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill)
+            .style(th::scrim)
             .into()
     }
+
+    /// 对话框里那句"从 x 到 y"
+    fn version_line(&self) -> String {
+        let new = match &self.update {
+            UpdateState::Available(nv) => nv.version.clone(),
+            _ => "?".to_string(),
+        };
+        format!("v{} → v{new}", crate::VERSION)
+    }
+
+    /// 「取消下载」按钮 —— 只有在下载中才能点
+    fn cancel_button(&self) -> Element<'_, Message> {
+        button(
+            text("取消下载")
+                .size(th::SIZE_CAPTION)
+                .font(self.fonts.regular),
+        )
+        .padding([5, 12])
+        .style(th::secondary_button)
+        .on_press_maybe(self.download.can_cancel().then_some(Message::CancelDownload))
+        .into()
+    }
+
 
     /// 右上角那颗「检查更新」按钮。
     ///
     /// 三种样子，取决于查到了什么：
     /// - 平时：「检查更新」，点一下再查
     /// - 查不动：「检查更新」，让用户能重试（查失败不摆脸色）
-    /// - 有新版本：变成醒目的「有新版本 v1.0.5」，点一下打开下载页
+    /// - 有新版本：变成醒目的「有新版本 v1.0.5」，点一下**在程序里下载**
+    ///   （早先是跳浏览器，但那样程序不知道用户下没下、下的是不是最新版，
+    ///   也给不出进度和取消）
     fn update_button(&self) -> Element<'_, Message> {
         let label = self.update.label();
-        let has_news = matches!(self.update, UpdateState::Available { .. });
+        let has_news = matches!(self.update, UpdateState::Available(_));
         let checking = self.update == UpdateState::Checking;
 
         let text_widget = text(label)
@@ -665,14 +1055,9 @@ impl App {
         let button = button(text_widget).padding([3, 10]);
 
         if has_news {
-            // 有新版本：强调色 + 点开下载页
-            let url = match &self.update {
-                UpdateState::Available { url, .. } => url.clone(),
-                _ => String::new(),
-            };
             return button
                 .style(th::primary_button)
-                .on_press(Message::OpenReleasePage(url))
+                .on_press(Message::StartDownload)
                 .into();
         }
 
@@ -1107,6 +1492,69 @@ fn open_in_browser(url: &str) {
 
 fn to_wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// 在资源管理器里定位到某个文件（打开所在文件夹并选中它）
+fn reveal_in_explorer(path: &std::path::Path) {
+    // explorer 的参数格式很挑：`/select,"完整路径"`，逗号后面不能有空格
+    let arg = format!("/select,\"{}\"", path.display());
+    let op = to_wide("open");
+    let file = to_wide("explorer.exe");
+    let params = to_wide(&arg);
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            op.as_ptr(),
+            file.as_ptr(),
+            params.as_ptr(),
+            std::ptr::null(),
+            1,
+        );
+    }
+}
+
+/// 启动刚下载好的新版。
+///
+/// 用 `ShellExecuteW` 而不是 `CreateProcess`：前者会正确处理 UAC 清单，
+/// 也不需要我们自己拼命令行。
+fn open_executable(path: &std::path::Path) -> Result<(), String> {
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    if !path.exists() {
+        return Err(format!("文件不见了：{}", path.display()));
+    }
+    let op = to_wide("open");
+    let file = to_wide(&path.display().to_string());
+    let result = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            op.as_ptr(),
+            file.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            1,
+        )
+    };
+    // ShellExecuteW 的返回值 > 32 才算成功（这是它的历史约定，不是错误码）
+    if (result as isize) <= 32 {
+        return Err(format!("系统拒绝打开（返回 {result:p}）"));
+    }
+    Ok(())
+}
+
+/// 下载的新版存到哪儿。
+///
+/// 优先放「下载」文件夹 —— 用户找得到、也符合直觉；
+/// 取不到就退回临时目录（总比没有强）。
+fn download_destination(version: &str) -> std::path::PathBuf {
+    let file_name = format!("PMCA-Installer-v{version}.exe");
+    if let Ok(home) = std::env::var("USERPROFILE") {
+        let downloads = std::path::Path::new(&home).join("Downloads");
+        if downloads.is_dir() {
+            return downloads.join(file_name);
+        }
+    }
+    std::env::temp_dir().join(file_name)
 }
 
 #[cfg(test)]
