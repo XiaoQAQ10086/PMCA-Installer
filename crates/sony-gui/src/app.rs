@@ -38,11 +38,17 @@ pub enum Camera {
     Checking,
     /// 没插相机
     Missing(String),
-    /// 相机插着，但 USB 连接方式不对（电脑遥控等），而且我们切不动
-    WrongUsbMode(String),
+    /// 相机插着，但 Windows 看不到它，而且我们认不出是什么连接方式
+    ///
+    /// ⚠️ 标题只描述现象，**不能**写"请改成 MTP 模式"：我们只在 α6300 上
+    /// 测过产品号，别的机型对不上很正常。旧版就是因此对着一个明明选了 MTP 的
+    /// α6000 喊"请改成 MTP 模式"。
+    ModeUnknown(String),
+    /// 相机是已知的海量存储器型号，但 Windows 没看到磁盘（八成没插存储卡）
+    MassStorageNoDisk(String),
     /// 相机在「海量存储器」模式 —— **这种机型就该这样，我们能自己切过去**
     ///
-    /// ⚠️ 和 `WrongUsbMode` 分开是有意的：那种情况要叫用户去改相机设置，
+    /// ⚠️ 和上面两种"看不到"的状态分开是有意的：那两种要叫用户去动相机设置，
     /// 这种情况**千万不要**（α6000 改成 MTP 反而彻底没戏）。
     MassStorage(String),
     /// 插着索尼设备但读不出信息（被占用 / 驱动问题）
@@ -393,9 +399,16 @@ impl App {
                         );
                         self.camera = Camera::MassStorage(model);
                     }
-                    P::WrongUsbMode => {
-                        self.push_log(Level::Warn, "相机插着，但 USB 连接方式不是 MTP");
-                        self.camera = Camera::WrongUsbMode(detail);
+                    P::ModeUnknown(_) => {
+                        self.push_log(
+                            Level::Warn,
+                            "相机插着，但 Windows 看不到它，也认不出是什么连接方式",
+                        );
+                        self.camera = Camera::ModeUnknown(detail);
+                    }
+                    P::MassStorageNoDisk(_) => {
+                        self.push_log(Level::Warn, "相机在海量存储器模式，但没看到磁盘（可能没插存储卡）");
+                        self.camera = Camera::MassStorageNoDisk(detail);
                     }
                     P::Unreadable(msg) => {
                         self.push_log(Level::Bad, format!("相机读不出来：{msg}"));
@@ -552,9 +565,16 @@ impl App {
             Camera::Unknown => (th::TEXT_FAINT, "尚未检测".to_string(), String::new()),
             Camera::Checking => (th::ACCENT, "正在检测…".to_string(), String::new()),
             Camera::Missing(why) => (th::DANGER, "未找到相机".to_string(), why.clone()),
-            Camera::WrongUsbMode(how) => (
+            // 标题只描述现象、不下结论 —— 我们不知道它是什么模式，
+            // 硬说"模式不对"会把用户带偏（α6000 那次就是）
+            Camera::ModeUnknown(how) => (
                 th::WARNING,
-                "请把相机改成 MTP 模式".to_string(),
+                "Windows 看不到相机".to_string(),
+                how.clone(),
+            ),
+            Camera::MassStorageNoDisk(how) => (
+                th::WARNING,
+                "相机里可能没插存储卡".to_string(),
                 how.clone(),
             ),
             // 绿色：这台相机**能用**，只是要先自动切一下。
@@ -1003,25 +1023,36 @@ mod tests {
     }
 
     /// ⚠️ 关键回归测试：相机设成海量存储器时，
-    /// 界面**不能**显示"未找到相机"——那会让用户去查线材、换 USB 口。
-    /// 必须显示"请把相机改成 MTP 模式"。
+    /// ⚠️⚠️ **回归测试：认不出模式时，标题不能替用户下结论。**
+    ///
+    /// 真机教训：有 α6000 用户明明选了 MTP，界面却显示"请把相机改成 MTP 模式"，
+    /// 因为他那台机器的产品号不在我们那张（只在 α6300 上测过的）清单里。
     #[test]
-    fn wrong_usb_mode_does_not_say_camera_not_found() {
+    fn unknown_mode_does_not_tell_the_user_to_switch_to_mtp() {
         let mut a = app();
-        a.on_worker(WorkerMsg::Camera(Ok(sony_install::CameraProbe::WrongUsbMode)));
+        a.on_worker(WorkerMsg::Camera(Ok(sony_install::CameraProbe::ModeUnknown(
+            "某某说明".to_string(),
+        ))));
+
+        let title = sony_install::CameraProbe::ModeUnknown(String::new()).title();
+        assert!(
+            !title.contains("改成 MTP"),
+            "我们并不知道它是不是 MTP，标题不能替用户下结论：{title}"
+        );
+        assert!(title.contains("看不到"), "标题应当只描述现象：{title}");
+        assert!(!title.contains("未找到"), "也不能说成没插相机：{title}");
 
         match &a.camera {
-            Camera::WrongUsbMode(detail) => {
-                assert!(detail.contains("MTP"), "说明里要教用户改成 MTP：{detail}");
-                assert!(!detail.contains("自动"), "不要给第二个选项：{detail}");
-            }
-            other => panic!("应进「模式不对」状态，实际 {other:?}"),
+            Camera::ModeUnknown(_) => {}
+            other => panic!("应进「认不出模式」状态，实际 {other:?}"),
         }
+    }
 
-        // 卡片标题必须是"改成 MTP"，不是"未找到相机"
-        let title = sony_install::CameraProbe::WrongUsbMode.title();
-        assert_eq!(title, "请把相机改成 MTP 模式");
-        assert!(!title.contains("未找到"), "标题不能误导用户");
+    /// 已知海量存储器型号但没看到磁盘 → 标题要指向存储卡
+    #[test]
+    fn mass_storage_without_disk_points_at_the_card() {
+        let title = sony_install::CameraProbe::MassStorageNoDisk(String::new()).title();
+        assert!(title.contains("存储卡"), "要指向存储卡：{title}");
     }
 
     /// 真的没插相机时，仍然要显示"未找到相机"

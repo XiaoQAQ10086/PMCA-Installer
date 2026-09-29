@@ -88,12 +88,18 @@ pub enum CameraProbe {
     Ready(CameraStatus),
     /// 相机在「海量存储器」模式，而且**我们能自己把它切过来**
     ///
-    /// ⚠️ 这和下面的 `WrongUsbMode` 是两码事，别合并：
-    /// 这种相机（α6000 等）就该用海量存储器模式，让用户"改成 MTP"是**反向指引** ——
-    /// 改了反而彻底没戏。我们要做的是自己发一条磁盘命令把它切过去。
+    /// ⚠️ 这和下面两种"看不到"的状态是两码事，别合并：
+    /// 这种相机（α6000 等）就该用海量存储器模式，让用户"改成 MTP"是**反向指引**。
     MassStorage { model: String },
-    /// 相机插着，但 USB 连接方式不对，而且**我们切不动**（既不是 MTP、也不是索尼磁盘）
-    WrongUsbMode,
+    /// 相机插着，但 Windows 看不到它，而且**认不出它现在是什么连接方式**
+    ///
+    /// ⚠️ 这种情况**不能**断言"模式不对"。我们只在 ILCE-6300 上实测过产品号，
+    /// 别的机型对不上很正常 —— 旧版就是因此对着一个**明明选了 MTP** 的
+    /// α6000 喊"请把相机改成 MTP 模式"。
+    ModeUnknown(String),
+    /// 相机是已知的「海量存储器」型号，但 Windows 没看到它的磁盘
+    /// （最常见：相机里没插存储卡）
+    MassStorageNoDisk(String),
     /// 插着索尼设备，但读不出设备信息（被别的程序占用 / 驱动问题）
     Unreadable(String),
     /// 没插相机
@@ -106,7 +112,9 @@ impl CameraProbe {
         match self {
             CameraProbe::Ready(_) => "已连接",
             CameraProbe::MassStorage { .. } => "相机在海量存储器模式",
-            CameraProbe::WrongUsbMode => "请把相机改成 MTP 模式",
+            // 标题只描述现象，不下结论 —— 我们并不知道它是什么模式
+            CameraProbe::ModeUnknown(_) => "Windows 看不到相机",
+            CameraProbe::MassStorageNoDisk(_) => "相机里可能没插存储卡",
             CameraProbe::Unreadable(_) => "相机读不出来",
             CameraProbe::NotFound => "未找到相机",
         }
@@ -122,8 +130,8 @@ impl CameraProbe {
             CameraProbe::MassStorage { model } => Some(format!(
                 "{model} · 这种机型就要用这个模式，安装时会自动切换，不用你去改相机设置"
             )),
-            CameraProbe::WrongUsbMode => {
-                Some(sony_usb::usbdev::WRONG_MODE_MESSAGE.to_string())
+            CameraProbe::ModeUnknown(msg) | CameraProbe::MassStorageNoDisk(msg) => {
+                Some(msg.clone())
             }
             CameraProbe::Unreadable(msg) => Some(msg.clone()),
             CameraProbe::NotFound => None,
@@ -296,7 +304,14 @@ fn classify_absent_camera() -> CameraProbe {
     }
     match sony_usb::usbdev::classify(&ids) {
         sony_usb::usbdev::Presence::None => CameraProbe::NotFound,
-        sony_usb::usbdev::Presence::WrongMode => CameraProbe::WrongUsbMode,
+        // ⚠️ 产品号不认识时**不能**说"模式不对" —— 见 `CameraProbe::ModeUnknown`
+        //    上的说明。这里如实转达"我们认不出来"，并把两种连接方式都给用户。
+        sony_usb::usbdev::Presence::UnknownMode => {
+            CameraProbe::ModeUnknown(sony_usb::usbdev::UNKNOWN_MODE_MESSAGE.to_string())
+        }
+        sony_usb::usbdev::Presence::MassStorageNoDisk => CameraProbe::MassStorageNoDisk(
+            sony_usb::usbdev::MASS_STORAGE_NO_DISK_MESSAGE.to_string(),
+        ),
         sony_usb::usbdev::Presence::NotVisible => {
             CameraProbe::Unreadable(sony_usb::usbdev::not_visible_message(&ids))
         }

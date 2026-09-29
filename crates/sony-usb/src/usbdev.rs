@@ -195,7 +195,19 @@ pub mod known_pids {
 /// 千万别把海量存储器的产品号加进来 —— 加了它就会被归到
 /// 「Windows 侧问题」，而实际应该归到「相机 USB 模式不对」，
 /// 给用户的提示方向就反了。
-fn mode_hint(product: u16) -> Option<&'static str> {
+/// 产品号是不是「本来就该被 WPD 看到」的 MTP 模式？
+///
+/// ⚠️⚠️ **这份清单只在 ILCE-6300 上实测过，别的机型不一定对得上。**
+///
+/// 所以它只能用来做一件事：**认出我们确定认识的情况**。
+/// 千万不能反过来用 —— 也就是"不在清单里 = 模式不对"。
+/// 真机教训：有 α6000 用户明明选了 MTP，程序却提示"请把相机改成 MTP 模式"，
+/// 就是因为 α6000 的 MTP 产品号不在清单里，被当成了"模式不对"。
+/// 拿一个机型的号码去判断所有机型，这个推断从一开始就不成立。
+///
+/// 另外：**别把海量存储器的产品号加进来**。加了它会被归到
+/// 「Windows 侧问题」，而实际该归到「相机连接方式」那一类。
+fn mtp_hint(product: u16) -> Option<&'static str> {
     match product {
         0x077A => Some("普通 MTP 模式"),
         0x06A8 => Some("应用安装模式"),
@@ -203,53 +215,87 @@ fn mode_hint(product: u16) -> Option<&'static str> {
     }
 }
 
+/// 产品号是不是已知的「海量存储器」模式？
+///
+/// 同样只在 ILCE-6300 上实测过。用途：相机在 Windows 里没变成磁盘时
+/// 给一句更准的话（八成是没插存储卡）。
+fn is_known_mass_storage(product: u16) -> bool {
+    product == KNOWN_MASS_STORAGE_PID
+}
+
+/// ILCE-6300 实测：海量存储器模式的产品号
+const KNOWN_MASS_STORAGE_PID: u16 = 0x0ABA;
+
 /// 索尼设备"在系统里是什么样子"的分类
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Presence {
     /// 一台索尼 USB 设备都没有
     None,
-    /// 找到了索尼设备，但它不是 MTP 模式（典型：海量存储器）
-    WrongMode,
     /// 找到了 MTP 模式的索尼设备，却没被 WPD 列出来
     /// （说明问题在 Windows 的驱动/服务，不是相机设置）
     NotVisible,
+    /// 产品号是已知的「海量存储器」，但 Windows 没看到它的磁盘
+    /// （最常见：相机里没插存储卡）
+    MassStorageNoDisk,
+    /// 插着索尼设备，但产品号我们不认识 —— **说不出是什么模式**
+    UnknownMode,
 }
 
 /// 把「枚举到的索尼 USB 设备」归类
 ///
-/// 这一步决定了给用户的提示方向 —— 归错了就会把用户带到错误的地方：
-/// 明明是相机菜单里一个选项不对，却让人去拔插线材、换 USB 口。
+/// ⚠️ 这一步决定了给用户的提示方向，归错了就会把人带到错误的地方。
+///
+/// 三条原则：
+/// 1. 产品号是已知 MTP 型号却没被 WPD 看到 → 那是 Windows 侧的问题
+/// 2. 产品号是已知海量存储器型号 → 差一张存储卡
+/// 3. **其它一律归到"说不准"** —— 因为我们只在 α6300 上测过产品号，
+///    没有依据判断别的机型现在是什么模式。宁可让用户两种都试一次，
+///    也不要斩钉截铁地给一个可能是反方向的指引。
 pub fn classify(ids: &[UsbId]) -> Presence {
     if ids.is_empty() {
         return Presence::None;
     }
-    // 有"本来就该被 WPD 看到"的设备（普通 MTP / 应用安装模式），
-    // 却还是没被列出来 → 问题在 Windows 那一侧
-    if ids.iter().any(|i| mode_hint(i.product).is_some()) {
-        Presence::NotVisible
-    } else {
-        Presence::WrongMode
+    if ids.iter().any(|i| mtp_hint(i.product).is_some()) {
+        return Presence::NotVisible;
     }
+    if ids.iter().any(|i| is_known_mass_storage(i.product)) {
+        return Presence::MassStorageNoDisk;
+    }
+    Presence::UnknownMode
 }
 
-/// 「USB 连接方式不对」的提示文字。
+/// 「插着索尼设备，但说不出是什么模式」的提示文字。
 ///
-/// 只说该怎么做，不解释原理 —— 用户要的是"我该按哪里"，
-/// 不是"为什么海量存储器不行"。
+/// # 为什么不能只教一种改法
 ///
-/// ⚠️ 最后那句例外**必须留着**。绝大多数机型确实要 MTP，
-/// 但有一类较老的机型（α6000 就是）正好相反：它**只能**用海量存储器模式。
-/// 少了这句，那类用户会按指引改成 MTP，然后撞上"不能装"，
-/// 来回折腾两头都是死路。
-pub const WRONG_MODE_MESSAGE: &str = "请把相机的 USB 连接方式改成「MTP」。\n\
+/// 旧版在这里断言"请把相机改成 MTP 模式"。那是**基于一张只在 α6300 上
+/// 测过的产品号清单**得出的结论 —— 对 α6000 这种 MTP 产品号不同的机型，
+/// 它会在用户**明明已经选了 MTP** 的时候还叫人家去改 MTP，纯属添乱。
+///
+/// 所以这里只说"我们认不出来"，并把两种连接方式都给出来让用户试。
+/// 虽然啰嗦一点，但不会把人往反方向带。
+pub const UNKNOWN_MODE_MESSAGE: &str = "相机插着，但 Windows 看不到它 —— 本工具认不出它现在的连接方式。\n\
      \n\
-     做法（在相机上改一次就行）：\n\
-     菜单 → 设置 → USB → USB 连接 → 选「MTP」\n\
+     请把两种连接方式各试一次。每次改完都要把 USB 线拔下来再插上：\n\
      \n\
-     改完把 USB 线拔下来再插上，然后重新点「开始安装」。\n\
+     菜单 → 设置 → USB → USB 连接\n\
+     · 选「MTP」\n\
+     · 选「海量存储器」（这个模式需要相机里插着存储卡）\n\
      \n\
-     ⚠️ 有一类较老的机型（比如 α6000）正好相反，需要「海量存储器」模式。\n\
-     那种机型本工具还不支持 —— 如果改成 MTP 后提示不能装，就是这个原因。";
+     α6000、NEX-6 这类较老机型要用「海量存储器」，较新的机型一般用 MTP。\n\
+     \n\
+     两种都试过还是不行，再依次排查：\n\
+     ① 换一个 USB 口，别用 USB 集线器\n\
+     ② 关掉可能占用相机的程序（照片应用、资源管理器预览、原版 PMCA）\n\
+     ③ 重启电脑";
+
+/// 「相机在海量存储器模式，但没看到磁盘」的提示文字
+pub const MASS_STORAGE_NO_DISK_MESSAGE: &str = "相机现在是「海量存储器」模式，但 Windows 没看到它的磁盘。\n\
+     \n\
+     最常见的原因是：**相机里没插存储卡**。\n\
+     海量存储器模式是把卡当成 U 盘用，没有卡就没有盘，程序也就认不出相机。\n\
+     \n\
+     请插一张存储卡，然后把 USB 线拔下来再插上。";
 
 /// 「MTP 设备存在、但 WPD 看不到」的提示文字
 pub fn not_visible_message(ids: &[UsbId]) -> String {
@@ -274,8 +320,9 @@ pub fn not_visible_message(ids: &[UsbId]) -> String {
 pub fn message_for(ids: &[UsbId]) -> Option<String> {
     match classify(ids) {
         Presence::None => None,
-        Presence::WrongMode => Some(WRONG_MODE_MESSAGE.to_string()),
         Presence::NotVisible => Some(not_visible_message(ids)),
+        Presence::MassStorageNoDisk => Some(MASS_STORAGE_NO_DISK_MESSAGE.to_string()),
+        Presence::UnknownMode => Some(UNKNOWN_MODE_MESSAGE.to_string()),
     }
 }
 
@@ -307,35 +354,47 @@ mod tests {
         assert_eq!(parse_vid_pid("VID_05"), None);
     }
 
-    /// 设备是"未知 PID"（也就是非 MTP 模式，典型就是海量存储器）
-    /// → 归类为 WrongMode，提示只需要教用户**怎么改成 MTP**
+    /// ⚠️⚠️ **回归测试：产品号不认识时，不能断言"模式不对"。**
+    ///
+    /// 真机教训：有 α6000 用户明明选了 MTP，界面却提示"请把相机改成 MTP 模式"。
+    /// 原因就是我们只把 α6300 实测的 0x077A / 0x06A8 当成"MTP 型号"，
+    /// 别的机型一律当成"模式不对" —— 拿一个机型的号码去判断所有机型。
     #[test]
-    fn unknown_pid_is_wrong_mode() {
+    fn unknown_pid_is_not_declared_wrong_mode() {
         let ids = [UsbId {
             vendor: 0x054C,
-            product: 0x0AAA, // 编一个：既不是 MTP 也不是应用安装模式
+            product: 0x0AAA, // 编一个我们没见过的型号
         }];
-        assert_eq!(classify(&ids), Presence::WrongMode);
+        assert_eq!(
+            classify(&ids),
+            Presence::UnknownMode,
+            "不认识的型号只能归到「说不准」，不能断言模式不对"
+        );
         let msg = message_for(&ids).expect("这种分类必须给出提示");
-        // 要教清楚怎么改
-        assert!(msg.contains("MTP"), "必须给出改法：{msg}");
-        assert!(msg.contains("菜单"), "要说清楚是在相机菜单里改");
-        assert!(msg.contains("USB"), "要指明是 USB 连接这一项");
-        // 不要露设备号，也不要用"U 盘"之类的原理说明
+        // 必须承认我们判断不了，而不是给一个可能是反方向的指引
+        assert!(
+            msg.contains("认不出") || msg.contains("看不到"),
+            "要如实说明我们认不出来：{msg}"
+        );
+        // 两种连接方式都要给出来让用户试
+        assert!(msg.contains("MTP"), "要给出 MTP 这条路：{msg}");
+        assert!(msg.contains("海量存储器"), "也要给出海量存储器那条路：{msg}");
+        assert!(msg.contains("菜单"), "要说清楚在相机菜单里改");
+        // 不要露设备号，也不要给"自动"这个第三选项
         assert!(!msg.contains("0AAA"), "不该把设备号摆给用户看：{msg}");
-        assert!(!msg.contains("U 盘"), "不用解释原理：{msg}");
-        // 用户要求：只推荐 MTP，不要再给"自动"这个第二选项
-        assert!(!msg.contains("自动"), "不要给第二个选项：{msg}");
+        assert!(!msg.contains("自动"), "不要给第三个选项：{msg}");
+    }
 
-        // 例外警告可以有，但**必须排在 MTP 指引之后** ——
-        // 主路径先给清楚，再补一句例外，别让用户一上来就看到"你这种情况不行"。
-        if let Some(alt) = msg.find("海量存储器") {
-            let main = msg.find("MTP").expect("主指引必须在");
-            assert!(
-                main < alt,
-                "MTP 的指引要排在例外之前，否则用户会以为自己在例外那一类：{msg}"
-            );
-        }
+    /// 已知的海量存储器型号，但 Windows 没看到磁盘 → 大概率是没插存储卡
+    #[test]
+    fn known_mass_storage_pid_hints_at_the_memory_card() {
+        let ids = [UsbId {
+            vendor: 0x054C,
+            product: KNOWN_MASS_STORAGE_PID,
+        }];
+        assert_eq!(classify(&ids), Presence::MassStorageNoDisk);
+        let msg = message_for(&ids).expect("这种分类必须给出提示");
+        assert!(msg.contains("存储卡"), "要说清楚是缺存储卡：{msg}");
     }
 
     /// 设备**本来就是 MTP 模式**却没被 WPD 列出来
@@ -374,13 +433,13 @@ mod tests {
         assert!(message_for(&[]).is_none(), "没插就不该硬凑提示");
     }
 
-    /// 提示里不能再出现"自动"这个可选值（用户要求只推荐 MTP）
+    /// 提示里不能再出现"自动"这个可选值
     #[test]
-    fn wrong_mode_message_only_mentions_mtp() {
-        assert!(WRONG_MODE_MESSAGE.contains("MTP"));
+    fn unknown_mode_message_has_no_auto_option() {
+        assert!(UNKNOWN_MODE_MESSAGE.contains("MTP"));
         assert!(
-            !WRONG_MODE_MESSAGE.contains("自动"),
-            "只教用户改成 MTP，不要给第二个选项"
+            !UNKNOWN_MODE_MESSAGE.contains("自动"),
+            "只给 MTP 和海量存储器两个选项，不要提「自动」"
         );
     }
 
