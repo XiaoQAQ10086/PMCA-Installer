@@ -41,6 +41,14 @@ features = [
     # 「海量存储器」（不是 WPD 设备），也能认出"相机其实插着，只是模式不对"
     "Win32_Devices_DeviceAndDriverInstallation",
     "Win32_Devices_Properties",
+    # 海量存储器通道：对磁盘卷发 SCSI 直通命令，把较老的机型
+    # （α6000 等）切到应用安装模式。见 sony-usb/src/msc.rs
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    # CreateFileW 的签名里带 SECURITY_ATTRIBUTES，所以被 gate 在 Security 下
+    "Win32_Security",
+    # DRIVE_REMOVABLE 在这个模块里
+    "Win32_System_WindowsProgramming",
 ]
 
 [profile.release]

@@ -86,7 +86,13 @@ impl CameraStatus {
 pub enum CameraProbe {
     /// 找到相机，可以直接用
     Ready(CameraStatus),
-    /// 相机插着，但 USB 连接方式不对（最常见：海量存储器）
+    /// 相机在「海量存储器」模式，而且**我们能自己把它切过来**
+    ///
+    /// ⚠️ 这和下面的 `WrongUsbMode` 是两码事，别合并：
+    /// 这种相机（α6000 等）就该用海量存储器模式，让用户"改成 MTP"是**反向指引** ——
+    /// 改了反而彻底没戏。我们要做的是自己发一条磁盘命令把它切过去。
+    MassStorage { model: String },
+    /// 相机插着，但 USB 连接方式不对，而且**我们切不动**（既不是 MTP、也不是索尼磁盘）
     WrongUsbMode,
     /// 插着索尼设备，但读不出设备信息（被别的程序占用 / 驱动问题）
     Unreadable(String),
@@ -99,6 +105,7 @@ impl CameraProbe {
     pub fn title(&self) -> &'static str {
         match self {
             CameraProbe::Ready(_) => "已连接",
+            CameraProbe::MassStorage { .. } => "相机在海量存储器模式",
             CameraProbe::WrongUsbMode => "请把相机改成 MTP 模式",
             CameraProbe::Unreadable(_) => "相机读不出来",
             CameraProbe::NotFound => "未找到相机",
@@ -112,12 +119,23 @@ impl CameraProbe {
                 "{} · 序列号 {} · 安装时自动切换到应用安装模式",
                 s.model, s.serial
             )),
+            CameraProbe::MassStorage { model } => Some(format!(
+                "{model} · 这种机型就要用这个模式，安装时会自动切换，不用你去改相机设置"
+            )),
             CameraProbe::WrongUsbMode => {
                 Some(sony_usb::usbdev::WRONG_MODE_MESSAGE.to_string())
             }
             CameraProbe::Unreadable(msg) => Some(msg.clone()),
             CameraProbe::NotFound => None,
         }
+    }
+
+    /// 这台相机现在能不能直接开始安装（不管是已经在安装模式，还是我们能切过去）
+    pub fn is_usable(&self) -> bool {
+        matches!(
+            self,
+            CameraProbe::Ready(_) | CameraProbe::MassStorage { .. }
+        )
     }
 }
 
@@ -248,6 +266,23 @@ pub fn probe_camera() -> Result<CameraProbe> {
 
 /// WPD 一台都没看到时，用 USB 层再问一次，判断到底是"没插"还是"模式不对"
 fn classify_absent_camera() -> CameraProbe {
+    // ⚠️ 先问"是不是海量存储器模式下的索尼相机"。
+    //
+    // 顺序很重要：这类相机（α6000 等）本来就该用海量存储器模式，
+    // 我们**能自己把它切过来**。如果先按"模式不对"处理，
+    // 就会给用户一个反向指引（"改成 MTP"），改了反而彻底没戏。
+    let msc = sony_usb::msc::list_sony_msc_devices();
+    if let Some(first) = msc.first() {
+        sony_core::market::trace_diag(&format!(
+            "[设备] 发现海量存储器模式的索尼相机：{}（{} 个分区）",
+            first.model,
+            msc.len()
+        ));
+        return CameraProbe::MassStorage {
+            model: first.model.clone(),
+        };
+    }
+
     let ids = sony_usb::usbdev::list_usb_ids_of_vendor(sony_usb::SONY_VENDOR_ID);
     // 设备号这类排查信息记进诊断日志，不摆到界面上
     if !ids.is_empty() {
@@ -268,6 +303,58 @@ fn classify_absent_camera() -> CameraProbe {
     }
 }
 
+/// 相机在「海量存储器」模式时，用磁盘命令把它切到应用安装模式。
+///
+/// 返回：
+/// - `Ok(true)`  —— 找到了海量存储器相机，并且切换成功
+/// - `Ok(false)` —— 压根没找到这种相机（调用方按"没插相机"处理）
+/// - `Err(..)`   —— 找到了但切不动（权限不够、相机不认这条命令…）
+///
+/// # 为什么逐个分区试
+///
+/// 真机实测：同一个相机上的多个分区**只有一个认这条命令**
+/// （α6300 上 SD 卡分区接受，`PMHOME` 小分区回 SCSI 状态 2）。
+/// 原项目是"取第一个"，这里改成**谁接受用谁**，更稳。
+fn switch_from_mass_storage(report: Reporter) -> Result<bool> {
+    let devices = sony_usb::msc::list_sony_msc_devices();
+    if devices.is_empty() {
+        return Ok(false);
+    }
+
+    step(
+        report,
+        format!(
+            "相机在「海量存储器」模式（{}）—— 正在让它切到应用安装模式…",
+            devices[0].model
+        ),
+    );
+
+    let mut last_error: Option<anyhow::Error> = None;
+    for d in &devices {
+        match d.switch_to_app_install_mode() {
+            Ok(()) => {
+                sony_core::market::trace_diag(&format!("[海量存储器] {} 接受了切换命令", d.volume));
+                return Ok(true);
+            }
+            Err(e) => {
+                // 被某个分区拒绝很正常（那不是主存储分区），记进日志继续试下一个
+                sony_core::market::trace_diag(&format!(
+                    "[海量存储器] {} 拒绝：{e:#}",
+                    d.volume
+                ));
+                last_error = Some(e);
+            }
+        }
+    }
+
+    Err(last_error
+        .unwrap_or_else(|| anyhow::anyhow!("没有可用的分区"))
+        .context(
+            "相机在「海量存储器」模式下，但没有一个分区接受切换命令。\n\
+             如果提示「拒绝访问」，请以管理员身份重新运行本程序。",
+        ))
+}
+
 /// 找相机；如果不在应用安装模式，就**命令相机自己切过去**。
 ///
 /// 为什么要自动切：相机在重新插拔、休眠、安装完成后都会**复位回普通 MTP 模式**。
@@ -281,7 +368,32 @@ pub fn find_and_prepare_camera(report: Reporter) -> Result<CameraStatus> {
     use sony_core::mtp;
     use sony_core::transport::PtpTransport;
 
-    let devices = sony_usb::list_sony_devices().context("枚举设备失败")?;
+    let mut devices = sony_usb::list_sony_devices().context("枚举设备失败")?;
+
+    // ---- WPD 看不到相机？可能它在「海量存储器」模式 ----
+    //
+    // 有一类机型（α6000 等）**必须**用这个模式：它们在 MTP 模式下根本不报告
+    // 那些扩展命令，所以在 MTP 那条路上无论怎么试都没用。
+    // 这里先发一条磁盘命令把相机切过去，切完它就变成普通的 MTP 设备，
+    // 后面的流程一行都不用改。
+    if devices.is_empty() && switch_from_mass_storage(report)? {
+        step(report, "正在等相机重新连接…");
+        let deadline = Instant::now() + MODE_SWITCH_TIMEOUT;
+        while Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(500));
+            devices = sony_usb::list_sony_devices().unwrap_or_default();
+            if !devices.is_empty() {
+                break;
+            }
+        }
+        if devices.is_empty() {
+            anyhow::bail!(
+                "相机接受了切换命令，但过了一段时间还没重新出现。\n\
+                 请把 USB 线拔下来再插上，然后重试。"
+            );
+        }
+    }
+
     if devices.is_empty() {
         return Err(no_camera_found());
     }

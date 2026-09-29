@@ -31,6 +31,7 @@ fn main() -> Result<()> {
         "camera" => camera_info()?,
         "probe" => probe_ops()?,
         "switch" => switch_mode()?,
+        "msc" => msc_probe(args.get(1).map(|s| s.as_str()))?,
         "install" => {
             let apk = args.get(1).context("用法：install <apk文件>")?;
             install_app(apk)?;
@@ -38,11 +39,60 @@ fn main() -> Result<()> {
         other => {
             eprintln!("未知命令：{other}");
             eprintln!(
-                "可用命令：tls-golden | spk <输入> <输出> | devices | camera | install <apk>"
+                "可用命令：tls-golden | spk <输入> <输出> | devices | camera | probe | switch | msc [switch] | install <apk>"
             );
         }
     }
     Ok(())
+}
+
+/// 海量存储器通道诊断。
+///
+/// `msc`        → 只列出找到的索尼相机磁盘（安全，不改状态）
+/// `msc switch` → 列出来，并试着把相机切到应用安装模式
+///
+/// 加这个命令是为了能在**真机上**验证 SCSI 直通那条路 ——
+/// 那条路涉及磁盘句柄、SCSI 结构体布局、sense 码解析，
+/// 光靠单元测试证明不了它对不对。
+fn msc_probe(action: Option<&str>) -> Result<()> {
+    println!("=== 正在找「海量存储器」模式的索尼相机 ===");
+    let devices = sony_usb::msc::list_sony_msc_devices();
+    if devices.is_empty() {
+        println!("  没找到。");
+        println!("  （相机需要在「海量存储器」模式，并且插着存储卡）");
+        return Ok(());
+    }
+    for d in &devices {
+        println!("  {}  型号={}", d.volume, d.model);
+    }
+
+    if action != Some("switch") {
+        println!();
+        println!("  只想列出的话到这里就够了。要切换请加参数：msc switch");
+        return Ok(());
+    }
+
+    println!();
+    println!("=== 正在让相机切到「应用安装模式」===");
+    // ⚠️ 相机的多个分区里**只有一个认这条命令**（真机实测：SD 卡分区行、
+    //    PMHOME 小分区不行）。所以逐个试，谁成功用谁 —— 不要"取第一个"。
+    let mut last_err = None;
+    for d in &devices {
+        match d.switch_to_app_install_mode() {
+            Ok(()) => {
+                println!("  ✅ {} 接受了命令，相机应该正在切换", d.volume);
+                println!();
+                println!("  等几秒后，相机应当变成一个 MTP 设备。");
+                println!("  可以用 `cargo run -p app -- devices` 确认。");
+                return Ok(());
+            }
+            Err(e) => {
+                println!("  {} 被拒绝：{e}", d.volume);
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("所有分区都试过了，都没成功")))
 }
 
 /// 把 APK 安装到相机上。

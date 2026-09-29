@@ -27,6 +27,7 @@
 use anyhow::Result;
 
 pub mod ffi;
+pub mod msc;
 pub mod usbdev;
 pub mod wpd;
 

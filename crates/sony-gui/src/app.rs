@@ -38,8 +38,13 @@ pub enum Camera {
     Checking,
     /// 没插相机
     Missing(String),
-    /// 相机插着，但 USB 连接方式不对（海量存储器 / 电脑遥控）
+    /// 相机插着，但 USB 连接方式不对（电脑遥控等），而且我们切不动
     WrongUsbMode(String),
+    /// 相机在「海量存储器」模式 —— **这种机型就该这样，我们能自己切过去**
+    ///
+    /// ⚠️ 和 `WrongUsbMode` 分开是有意的：那种情况要叫用户去改相机设置，
+    /// 这种情况**千万不要**（α6000 改成 MTP 反而彻底没戏）。
+    MassStorage(String),
     /// 插着索尼设备但读不出信息（被占用 / 驱动问题）
     Unreadable(String),
     /// 找到了，可以用
@@ -381,6 +386,13 @@ impl App {
                         );
                         self.camera = Camera::Found(status);
                     }
+                    P::MassStorage { model } => {
+                        self.push_log(
+                            Level::Good,
+                            format!("找到相机 {model}，在海量存储器模式（安装时会自动切换）"),
+                        );
+                        self.camera = Camera::MassStorage(model);
+                    }
                     P::WrongUsbMode => {
                         self.push_log(Level::Warn, "相机插着，但 USB 连接方式不是 MTP");
                         self.camera = Camera::WrongUsbMode(detail);
@@ -543,6 +555,13 @@ impl App {
             Camera::WrongUsbMode(how) => (
                 th::WARNING,
                 "请把相机改成 MTP 模式".to_string(),
+                how.clone(),
+            ),
+            // 绿色：这台相机**能用**，只是要先自动切一下。
+            // 用绿色是刻意的 —— 别让用户以为出了问题要自己去折腾。
+            Camera::MassStorage(how) => (
+                th::SUCCESS,
+                "相机在海量存储器模式".to_string(),
                 how.clone(),
             ),
             Camera::Unreadable(why) => (th::DANGER, "相机读不出来".to_string(), why.clone()),
