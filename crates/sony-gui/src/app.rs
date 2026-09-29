@@ -14,7 +14,7 @@
 use std::sync::mpsc::{Receiver, TryRecvError};
 
 use iced::widget::{Space, button, column, container, progress_bar, row, scrollable, space, text};
-use iced::{Alignment, Element, Length};
+use iced::{Alignment, Element, Length, Task};
 
 use crate::fonts::Fonts;
 use crate::theme as th;
@@ -110,6 +110,8 @@ pub enum Message {
     Tick,
     /// 清空运行日志
     ClearLog,
+    /// 把运行日志复制到剪贴板
+    CopyLog,
     /// 用户把文件拖进了窗口
     ApkDropped(std::path::PathBuf),
     /// 不关心的窗口事件（定位、缩放等），什么都不做
@@ -251,7 +253,11 @@ impl App {
 
     // ------------------------------------------------------------ 消息处理
 
-    pub fn update(&mut self, message: Message) {
+    /// 处理一条消息。
+    ///
+    /// 返回 `Task` 是因为"复制到剪贴板"要交给 iced 去做
+    /// （剪贴板是操作系统的资源，不能直接同步写）。其余消息返回 `Task::none()`。
+    pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::CheckCamera => {
                 if !self.stage.busy() {
@@ -272,6 +278,18 @@ impl App {
                 self.log.clear();
                 self.push_log(Level::Info, "日志已清空");
             }
+            Message::CopyLog => {
+                // ⚠️ 先把要复制的内容取出来，**再**写"已复制"那条日志 ——
+                //    否则复制出去的文本里会多出一句自言自语。
+                let text = self.log_text();
+                // 这里的 `self.log.len()` 在 push_log 之前求值，
+                // 所以报的是**实际复制走的行数**，不含这条提示。
+                self.push_log(
+                    Level::Info,
+                    format!("已复制到剪贴板（{} 行）", self.log.len()),
+                );
+                return iced::clipboard::write(text);
+            }
             Message::ApkDropped(path) => {
                 if !self.stage.busy() {
                     self.accept_apk(path);
@@ -280,6 +298,22 @@ impl App {
             Message::Tick => self.drain_workers(),
             Message::Ignored => {}
         }
+        Task::none()
+    }
+
+    /// 拼出要复制到剪贴板的文本。
+    ///
+    /// 开头带版本号：用户把这段贴出来求助时，
+    /// "是哪个版本"往往是最先要问的问题，省一轮来回。
+    fn log_text(&self) -> String {
+        let mut out = String::with_capacity(self.log.len() * 60 + 64);
+        out.push_str(&format!("PMCA 安装器 v{}\n", crate::VERSION));
+        out.push_str("----------------\n");
+        for (_, line) in &self.log {
+            out.push_str(line);
+            out.push('\n');
+        }
+        out
     }
 
     /// 把后台线程已经报上来的消息全部取出来（不阻塞）
@@ -722,6 +756,20 @@ impl App {
             .width(Length::Fill)
             .anchor_bottom();
 
+        // 「复制」放在「清空」左边。
+        //
+        // 复制**不**受"正在安装"限制 —— 恰恰相反，
+        // 安装卡住的时候最需要把日志复制出来发给别人看。
+        // 只有日志为空时才禁用。
+        let copy = button(
+            text("复制")
+                .size(th::SIZE_CAPTION)
+                .font(self.fonts.regular),
+        )
+        .padding([4, 10])
+        .style(th::secondary_button)
+        .on_press_maybe((!self.log.is_empty()).then_some(Message::CopyLog));
+
         let clear = button(
             text("清空")
                 .size(th::SIZE_CAPTION)
@@ -737,9 +785,9 @@ impl App {
             "④ 运行日志",
             self.fonts,
             column![
-                // 说明文字按用户要求去掉了，只留右下角的「清空」按钮。
+                // 说明文字按用户要求去掉了，只留右下角两个按钮。
                 // 用 space 把按钮顶到右边，保持原来的位置。
-                row![space::horizontal(), clear].align_y(Alignment::Center),
+                row![space::horizontal(), copy, clear].align_y(Alignment::Center).spacing(6),
                 area,
             ]
             .spacing(6)
@@ -980,7 +1028,7 @@ mod tests {
     #[test]
     fn cannot_start_without_an_apk() {
         let mut a = app();
-        a.update(Message::Start);
+        let _ = a.update(Message::Start);
         assert_eq!(a.stage, Stage::Idle, "没选文件时不该开始安装");
         assert!(a.rx.is_none(), "也不该起后台线程");
     }
@@ -989,8 +1037,58 @@ mod tests {
     fn clear_log_keeps_a_marker_line() {
         let mut a = app();
         a.push_log(Level::Info, "一些旧日志");
-        a.update(Message::ClearLog);
+        let _ = a.update(Message::ClearLog);
         assert_eq!(a.log.len(), 1, "清空后只留一条说明");
         assert!(a.log[0].1.contains("已清空"));
+    }
+
+    /// 复制出去的文本要带版本号。
+    ///
+    /// 用户把日志贴出来求助时，"是哪个版本"往往是最先要问的，
+    /// 写在开头能省一轮来回。
+    #[test]
+    fn log_text_has_version_and_every_line() {
+        let mut a = app();
+        a.push_log(Level::Info, "第一条");
+        a.push_log(Level::Bad, "第二条出错了");
+
+        let t = a.log_text();
+        assert!(t.contains(crate::VERSION), "开头要带版本号：\n{t}");
+        assert!(t.contains("第一条"));
+        assert!(t.contains("第二条出错了"));
+        assert_eq!(
+            t.lines().count(),
+            a.log.len() + 2,
+            "应当是「版本行 + 分隔线 + 每行日志」"
+        );
+    }
+
+    /// ⚠️ 复制出去的内容里**不能**混进"已复制"这句提示。
+    ///
+    /// `update` 里是先取文本、再写提示，这个顺序不能反 ——
+    /// 反了的话用户第一次复制得到的内容会以一句自言自语结尾，
+    /// 贴给别人看很奇怪。
+    #[test]
+    fn copied_text_excludes_the_confirmation_line() {
+        let mut a = app();
+        a.push_log(Level::Info, "真正的内容");
+
+        // 模拟 update 里的顺序：先取文本
+        let copied = a.log_text();
+        // 再写提示
+        a.push_log(Level::Info, "已复制到剪贴板（1 行）");
+
+        assert!(copied.contains("真正的内容"));
+        assert!(!copied.contains("已复制"), "复制出去的内容里不该有提示：\n{copied}");
+        assert!(a.log.last().unwrap().1.contains("已复制"), "界面上要有提示");
+    }
+
+    /// 日志为空时点复制不该出问题
+    #[test]
+    fn copy_with_empty_log_is_harmless() {
+        let mut a = app();
+        let _ = a.update(Message::CopyLog);
+        // 空日志时 log_text 只有版本行和分隔线，不该 panic
+        assert!(a.log_text().contains(crate::VERSION));
     }
 }

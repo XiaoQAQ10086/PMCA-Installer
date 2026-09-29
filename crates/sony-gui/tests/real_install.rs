@@ -63,7 +63,7 @@ fn gui_install_flow_end_to_end() {
     assert!(app.has_apk(), "选中之后应该记住了这个文件");
 
     // ---- 3. 相当于"用户点了开始安装" ----
-    app.update(Message::Start);
+    let _ = app.update(Message::Start);
     assert_eq!(
         app.stage(),
         Stage::Preparing,
@@ -75,7 +75,7 @@ fn gui_install_flow_end_to_end() {
     let deadline = Instant::now() + TIMEOUT;
     let mut last_stage = app.stage();
     while Instant::now() < deadline {
-        app.update(Message::Tick);
+        let _ = app.update(Message::Tick);
         if matches!(app.stage(), Stage::Done | Stage::Failed) {
             break;
         }
@@ -114,7 +114,7 @@ fn gui_install_flow_end_to_end() {
 #[test]
 fn start_without_apk_does_nothing() {
     let mut app = App::new(Fonts::from_family(fonts::Fonts::default_family()), FontStatus::UiOnly);
-    app.update(Message::Start);
+    let _ = app.update(Message::Start);
     assert_eq!(app.stage(), Stage::Idle);
     assert!(app.log_lines().count() >= 1, "至少该有一条字体状态日志");
 }

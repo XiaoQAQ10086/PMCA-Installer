@@ -46,7 +46,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "app"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "anyhow",
  "rsa",
@@ -2801,7 +2801,7 @@ dependencies = [
 
 [[package]]
 name = "sony-core"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "aes",
  "anyhow",
@@ -2823,7 +2823,7 @@ dependencies = [
 
 [[package]]
 name = "sony-gui"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "anyhow",
  "iced",
@@ -2837,7 +2837,7 @@ dependencies = [
 
 [[package]]
 name = "sony-install"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "anyhow",
  "sony-core",
@@ -2846,7 +2846,7 @@ dependencies = [
 
 [[package]]
 name = "sony-usb"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "anyhow",
  "cc",
