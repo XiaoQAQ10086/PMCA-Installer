@@ -3,8 +3,9 @@
 //! 这些字节是从真机（索尼 ILCE-6300）通过 USB 录下的原始数据，不是构造出来的。
 //! 新实现必须能正确处理它们 —— 所有相关测试都以此为基准。
 //!
-//! 来源：`D:\Sonny\ref\golden\clienthello-a6300.bin`
-//! 采集脚本：`D:\Sonny\tools\pmca_recorder.py`
+//! 来源与采集脚本在本仓库**外面**的资料目录里（本机位置）：
+//! `D:\AI Work\sony-app-installer-资料\ref\golden\clienthello-a6300.bin`
+//! `D:\AI Work\sony-app-installer-资料\tools\pmca_recorder.py`
 //!
 //! # 为什么用十六进制字符串而不是字节数组
 //!
