@@ -12,6 +12,7 @@
 //! 界面只负责显示它报上来的结果。这样窗口永远不会卡死。
 
 use std::sync::mpsc::{Receiver, TryRecvError};
+use std::time::{Duration, Instant};
 
 use iced::widget::{
     canvas,
@@ -25,6 +26,18 @@ use crate::worker::{self, ApkChoice, WorkerMsg};
 
 /// 日志最多留多少行（防止长时间运行把内存撑起来）
 const MAX_LOG_LINES: usize = 400;
+
+/// 装完之后隔多久自动重新检测相机。
+///
+/// 相机会在装完后复位（重启自己的应用管理服务），复位期间去开会话有可能会失败，
+/// 所以先等一会儿再说。
+const RECHECK_FIRST_DELAY: Duration = Duration::from_millis(2500);
+
+/// 重检没成功时，隔多久再试一次
+const RECHECK_RETRY_DELAY: Duration = Duration::from_millis(1500);
+
+/// 重检最多试几次（含第一次）
+const RECHECK_MAX_ATTEMPTS: u8 = 4;
 
 // ---------------------------------------------------------------- 状态
 
@@ -58,6 +71,34 @@ pub enum Camera {
     Unreadable(String),
     /// 找到了，可以用
     Found(sony_install::CameraStatus),
+}
+
+/// 装完之后预约的「自动重新检测」。
+///
+/// # 为什么需要它
+///
+/// 装完相机会复位，此刻立刻去检测有可能失败。旧版的做法是干脆把相机状态清空、
+/// 显示成"尚未检测" —— 结果用户看到的是「没检测到相机」，而相机其实好端端插着，
+/// 再点一次安装照样能装（用户报过这个）。
+///
+/// 现在的做法：**保留**卡片上原有的相机信息，隔一会儿自动重检；
+/// 中间查不到**不动界面**（那多半只是相机还没复位完），
+/// 试到最后一次还是查不到，才如实显示。
+#[derive(Debug, Clone, Copy)]
+struct Recheck {
+    /// 还能再试几次（含正在等的那一次）
+    attempts_left: u8,
+    /// 到点了才发下一次检测
+    due: Instant,
+}
+
+/// 这次检测结果是不是「暂时没看到相机」（值得等一会儿再试）。
+///
+/// 只有**完全没看到**才算。`ModeUnknown` / `MassStorageNoDisk` 之类
+/// 都是已经看到索尼设备了，属于有效结论，重试反而是浪费。
+fn is_transient_miss_probe(probe: &sony_install::CameraProbe) -> bool {
+    use sony_install::CameraProbe as P;
+    matches!(probe, P::NotFound | P::Unreadable(_))
 }
 
 /// 安装处在哪一步
@@ -120,6 +161,8 @@ pub struct App {
     download_rx: Option<Receiver<WorkerMsg>>,
     /// 取消下载用的旗子（和下载线程共享）
     download_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// 装完之后预约的自动重检（见 `Recheck`）
+    recheck: Option<Recheck>,
 }
 
 /// 检查更新的状态
@@ -239,6 +282,7 @@ impl App {
             download: DownloadState::Idle,
             download_rx: None,
             download_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            recheck: None,
             font_status,
         };
         match font_status {
@@ -400,9 +444,58 @@ impl App {
     // ------------------------------------------------------------ 动作
 
     fn begin_check(&mut self) {
+        // 手动检测是"用户要的答案"，压过之前预约的自动重检 ——
+        // 否则手动查出来的失败结果会被当成"重检中间失败"吞掉，
+        // 卡片就一直停在"正在检测…"了。
+        self.recheck = None;
         self.camera = Camera::Checking;
         self.push_log(Level::Info, "正在检测相机…");
         self.rx = Some(worker::spawn_probe());
+    }
+
+    /// 预约一次装完之后的自动重检
+    fn schedule_recheck(&mut self) {
+        self.recheck = Some(Recheck {
+            attempts_left: RECHECK_MAX_ATTEMPTS,
+            due: Instant::now() + RECHECK_FIRST_DELAY,
+        });
+    }
+
+    /// 重检时查不到相机 → 还该不该再试一次。
+    ///
+    /// 返回 `true` 表示"已经安排了下一次，这次的失败结果丢掉、界面不动"。
+    fn defer_recheck(&mut self) -> bool {
+        let Some(r) = self.recheck else {
+            return false;
+        };
+        if r.attempts_left <= 1 {
+            // 已经是最后一次 —— 如实显示结果，不再接着试
+            return false;
+        }
+        self.recheck = Some(Recheck {
+            attempts_left: r.attempts_left - 1,
+            due: Instant::now() + RECHECK_RETRY_DELAY,
+        });
+        self.push_log(Level::Info, "相机还在复位，稍后再检测一次…");
+        true
+    }
+
+    /// 该不该现在发一次重检（只看条件，不实际发 —— 方便测试）
+    fn recheck_due(&self, now: Instant) -> bool {
+        match self.recheck {
+            // 上一次检测还没回来 → 再等等
+            Some(r) => self.rx.is_none() && now >= r.due,
+            None => false,
+        }
+    }
+
+    /// 到点了就发下一次重检。由 `Tick` 驱动。
+    ///
+    /// `now` 是参数而不是直接读时钟，是为了让测试能"快进"。
+    fn tick_recheck(&mut self, now: Instant) {
+        if self.recheck_due(now) {
+            self.rx = Some(worker::spawn_probe());
+        }
     }
 
     fn begin_pick(&mut self) {
@@ -434,6 +527,9 @@ impl App {
         self.percent = 0;
         self.status = "正在准备…".into();
         self.report = None;
+        // 上一次装完预约的重检就此作废：这次安装自己会重新检测，
+        // 装完还会再预约一次
+        self.recheck = None;
         self.push_log(
             Level::Info,
             format!("开始安装 {name}（{}）", human_size(size)),
@@ -634,6 +730,8 @@ impl App {
                 self.push_log(Level::Bad, "操作意外中断：后台线程已退出");
             }
         }
+        // ---- 装完之后预约的自动重检 ----
+        self.tick_recheck(Instant::now());
     }
 
     /// 检查更新的结果回来了
@@ -663,6 +761,14 @@ impl App {
     fn on_worker(&mut self, msg: WorkerMsg) {
         match msg {
             WorkerMsg::Camera(Ok(probe)) => {
+                // 装完之后那次**自动重检**：相机刚复位时查不到很正常，
+                // 中间失败不该画到界面上（用户会以为相机掉线了），
+                // 等一会儿再试一次。见 `Recheck`。
+                if is_transient_miss_probe(&probe) && self.defer_recheck() {
+                    return;
+                }
+                // 不管结果如何，这次预约到此为止
+                self.recheck = None;
                 use sony_install::CameraProbe as P;
                 let detail = probe.detail().unwrap_or_default();
                 // 排查用的设备摘要（可能为空），只写进日志
@@ -721,6 +827,10 @@ impl App {
                 }
             }
             WorkerMsg::Camera(Err(e)) => {
+                if self.defer_recheck() {
+                    return;
+                }
+                self.recheck = None;
                 self.push_log(Level::Bad, format!("检测相机失败：{e}"));
                 self.camera = Camera::Missing(e);
             }
@@ -754,14 +864,17 @@ impl App {
                 }
                 self.report = outcome.device_report;
                 // 安装完成后相机会复位回普通模式。
-                // 这里**不**自动重新检测：刚装完相机还在复位中，立刻去开会话
-                // 有可能失败，界面上就会跳出"未找到相机"吓到用户。
-                // 反正真正安装时 `sony-install` 会自己重新检测并切模式，
-                // 所以显示暂时旧一点不影响任何功能。
-                self.camera = Camera::Unknown;
+                //
+                // ⚠️ 这里**不要**把相机状态清空。清空的话卡片会变成"尚未检测"，
+                //    看起来就像相机掉线了 —— 而它其实好端端插着，再点一次安装
+                //    也照样能装（用户报过这个）。
+                //    改成保留原有的相机信息 + 隔一会儿自动重检：
+                //    查到了就刷新成真实状态，中间查不到也不改界面
+                //    （那多半只是相机还没复位完）。
+                self.schedule_recheck();
                 self.push_log(
                     Level::Info,
-                    "相机已复位（下次安装会自动重新检测并切换模式）",
+                    "相机正在复位，稍后自动重新检测（不用手动点）",
                 );
             }
             WorkerMsg::Finished(Err(e)) => {
@@ -1609,6 +1722,16 @@ mod tests {
         App::new(Fonts::from_family("x"), FontStatus::UiOnly)
     }
 
+    /// 一台"已经检测到"的相机 —— 用来观察装完之后卡片会不会被清空
+    fn found_camera() -> Camera {
+        Camera::Found(sony_install::CameraStatus {
+            pnp_id: "usb#vid_054c&pid_077a".into(),
+            model: "ILCE-6300".into(),
+            serial: "05130861".into(),
+            app_install_mode: true,
+        })
+    }
+
     #[test]
     fn human_size_reads_naturally() {
         assert_eq!(human_size(512), "512 字节");
@@ -1671,14 +1794,139 @@ mod tests {
     fn success_ends_in_done() {
         let mut a = app();
         a.stage = Stage::Installing;
+        a.camera = found_camera();
         a.on_worker(WorkerMsg::Finished(Ok(InstallOutcome {
             device_report: None,
         })));
         assert_eq!(a.stage, Stage::Done);
         assert_eq!(a.percent, 100);
+        // ⚠️ 回归测试：装完**不能**把相机状态清空。
+        //    清空的话卡片会显示"尚未检测"，看起来就像相机掉线了 ——
+        //    而相机其实还连着呢（用户报过这个）。
         assert!(
-            matches!(a.camera, Camera::Unknown),
-            "装完相机状态应标为待重检"
+            matches!(a.camera, Camera::Found(_)),
+            "装完相机还在，不该显示成没检测到"
+        );
+        assert!(a.recheck.is_some(), "装完应预约一次自动重检");
+    }
+
+    /// 装完之后**过一会儿**才自动重检 —— 不能立刻查。
+    /// 刚装完相机还在复位，立刻查多半查不出东西，还可能查出"没有相机"。
+    #[test]
+    fn recheck_waits_before_probing_again() {
+        let mut a = app();
+        a.stage = Stage::Installing;
+        a.camera = found_camera();
+        a.on_worker(WorkerMsg::Finished(Ok(InstallOutcome {
+            device_report: None,
+        })));
+
+        let t0 = Instant::now();
+        assert!(!a.recheck_due(t0), "刚装完不能马上去检测");
+        assert!(
+            a.recheck_due(t0 + RECHECK_FIRST_DELAY),
+            "等够了时间就应该去检测"
+        );
+    }
+
+    /// 重检中间"查不到"时：界面**不动**，只安排下一次
+    #[test]
+    fn recheck_retries_quietly_without_blanking_the_camera() {
+        let mut a = app();
+        a.stage = Stage::Installing;
+        a.camera = found_camera();
+        a.on_worker(WorkerMsg::Finished(Ok(InstallOutcome {
+            device_report: None,
+        })));
+
+        // 相机还在复位 → 这一查什么也没查到
+        a.on_worker(WorkerMsg::Camera(Ok(sony_install::CameraProbe::NotFound)));
+
+        assert!(
+            matches!(a.camera, Camera::Found(_)),
+            "中间失败不该把相机显示成没找到"
+        );
+        assert!(a.recheck.is_some(), "还该留着重试的机会");
+        assert_eq!(
+            a.recheck.unwrap().attempts_left,
+            RECHECK_MAX_ATTEMPTS - 1,
+            "应该只消耗掉一次机会"
+        );
+    }
+
+    /// 试到最后还是查不到 → 不再瞒着，如实显示
+    #[test]
+    fn recheck_finally_admits_the_camera_is_gone() {
+        let mut a = app();
+        a.stage = Stage::Installing;
+        a.camera = found_camera();
+        a.on_worker(WorkerMsg::Finished(Ok(InstallOutcome {
+            device_report: None,
+        })));
+
+        for _ in 0..RECHECK_MAX_ATTEMPTS {
+            a.on_worker(WorkerMsg::Camera(Ok(sony_install::CameraProbe::NotFound)));
+        }
+
+        assert!(
+            matches!(a.camera, Camera::Missing(_)),
+            "重试到头还是查不到，就要如实说没找到"
+        );
+        assert!(a.recheck.is_none(), "不该没完没了地重试");
+    }
+
+    /// 重检查到了 → 卡片刷新成真实状态，预约结束
+    #[test]
+    fn recheck_found_refreshes_the_camera_card() {
+        let mut a = app();
+        a.stage = Stage::Installing;
+        a.camera = found_camera();
+        a.on_worker(WorkerMsg::Finished(Ok(InstallOutcome {
+            device_report: None,
+        })));
+
+        a.on_worker(WorkerMsg::Camera(Ok(sony_install::CameraProbe::Ready(
+            sony_install::CameraStatus {
+                pnp_id: "usb#vid_054c&pid_077a".into(),
+                model: "ILCE-6300".into(),
+                serial: "05130861".into(),
+                app_install_mode: false,
+            },
+        ))));
+
+        match &a.camera {
+            Camera::Found(s) => assert!(!s.app_install_mode, "应刷新成刚查到的那份信息"),
+            other => panic!("应显示相机已找到，实际 {other:?}"),
+        }
+        assert!(a.recheck.is_none(), "查到了就不用再预约了");
+    }
+
+    /// 手动点「重新检测」时，之前预约的自动重检要让位 ——
+    /// 否则手动查出来的结果会被当成"重检中间失败"吞掉，
+    /// 卡片就一直停在"正在检测…"。
+    #[test]
+    fn manual_check_cancels_the_pending_recheck() {
+        let mut a = app();
+        a.stage = Stage::Installing;
+        a.camera = found_camera();
+        a.on_worker(WorkerMsg::Finished(Ok(InstallOutcome {
+            device_report: None,
+        })));
+        assert!(a.recheck.is_some());
+
+        a.begin_check();
+        assert!(a.recheck.is_none(), "手动检测后不该再留着自动重检");
+    }
+
+    /// 手动检测失败时仍然要如实显示 —— "重检容错"不能把正常报错也吞掉
+    #[test]
+    fn manual_check_still_reports_failure() {
+        let mut a = app();
+        a.camera = found_camera();
+        a.on_worker(WorkerMsg::Camera(Ok(sony_install::CameraProbe::NotFound)));
+        assert!(
+            matches!(a.camera, Camera::Missing(_)),
+            "没在重检时，查不到就该如实说"
         );
     }
 
