@@ -36,18 +36,30 @@ use anyhow::{Result, bail};
 use core::ffi::c_void;
 
 use windows_sys::Win32::Networking::WinHttp::{
-    WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_FLAG_SECURE, WINHTTP_QUERY_CONTENT_LENGTH,
-    WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_QUERY_STATUS_CODE, WinHttpCloseHandle, WinHttpConnect,
+    WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_DISABLE_REDIRECTS, WINHTTP_FLAG_SECURE,
+    WINHTTP_OPTION_DISABLE_FEATURE, WINHTTP_QUERY_CONTENT_LENGTH, WINHTTP_QUERY_FLAG_NUMBER,
+    WINHTTP_QUERY_LOCATION, WINHTTP_QUERY_STATUS_CODE, WinHttpCloseHandle, WinHttpConnect,
     WinHttpOpen, WinHttpOpenRequest, WinHttpQueryHeaders, WinHttpReadData, WinHttpReceiveResponse,
-    WinHttpSendRequest, WinHttpSetTimeouts,
+    WinHttpSendRequest, WinHttpSetOption, WinHttpSetTimeouts,
 };
 
-/// 查询最新版本的接口
+/// 仓库主页（拼各种链接用）
+const REPO_URL: &str = "https://github.com/XiaoQAQ10086/PMCA-Installer";
+
+/// 查最新版本的**网页**地址（不是 API）。
+///
+/// 它本身会 302 跳到 `.../releases/tag/<版本号>`，我们只要那个跳转地址就够了，
+/// 连网页正文都不用下载 —— 见 `check_via_redirect`。
+pub const RELEASES_PAGE: &str = "https://github.com/XiaoQAQ10086/PMCA-Installer/releases/latest";
+
+/// 查最新版本的 **API** 地址。
+///
+/// ⚠️ 它对**没登录**的请求每小时只给 60 次。同一个出口 IP 后面往往坐着很多人
+/// （公司网络、公共代理……），很容易被用光；用光之后只会回一句
+/// `403 rate limit exceeded`，程序就再也查不到更新了。
+/// 所以它只是**备胎**，正常走上面那个网页地址。
 const RELEASES_API: &str =
     "https://api.github.com/repos/XiaoQAQ10086/PMCA-Installer/releases/latest";
-
-/// 万一接口没给出链接，就退到发布页
-pub const RELEASES_PAGE: &str = "https://github.com/XiaoQAQ10086/PMCA-Installer/releases/latest";
 
 /// 我们要下的是哪个附件
 const ASSET_NAME: &str = "PMCA-Installer.exe";
@@ -104,7 +116,44 @@ pub enum UpdateCheck {
 /// 网络不好的时候它会卡好几秒，绝不能放在界面线程上。
 pub fn check(current: &str) -> UpdateCheck {
     let agent = format!("PMCA-Installer/{current}");
-    let body = match http_get_text(RELEASES_API, &agent) {
+
+    // ① 先走**不碰 API** 的那条路。
+    //
+    // ⚠️ 这一步是必须的：api.github.com 对没登录的请求每小时只给 60 次，
+    //    同一个出口 IP 后面往往坐着很多人（公司网络、公共代理……），很容易被用光。
+    //    用光之后接口只回一句 `403 rate limit exceeded`，程序就再也查不到更新 ——
+    //    而且用户完全不知道为什么。github.com 自己的网页跳转没有这个限制。
+    match check_via_redirect(current, &agent) {
+        Ok(result) => result,
+        // ② 网页那条路不通（GitHub 改了跳转、或者被中间网络拦了）才退回 API。
+        //    它有限流，但作为备胎总比彻底查不了强。
+        Err(e) => {
+            sony_core::market::trace_diag(&format!(
+                "[更新] 网页跳转查版本失败，改用 API：{e:#}"
+            ));
+            check_via_api(current, &agent)
+        }
+    }
+}
+
+/// 用 `github.com/<仓库>/releases/latest` 的 **302 跳转**查版本。
+///
+/// 服务器只回响应头（`Location: .../releases/tag/v1.2.0`），正文一个字节都不用下，
+/// 比 API 那条路还省流量，而且**不限流**。
+fn check_via_redirect(current: &str, agent: &str) -> Result<UpdateCheck> {
+    // 关掉自动跳转 —— 我们要的就是那个 302 本身
+    let request = GetRequest::send(RELEASES_PAGE, agent, false)?;
+    let location = request
+        .location()
+        .ok_or_else(|| anyhow::anyhow!("跳转响应里没有 Location"))?;
+    let tag = tag_from_release_url(&location)
+        .ok_or_else(|| anyhow::anyhow!("认不出这个地址里的版本号：{location}"))?;
+    Ok(verdict_for_tag(&tag, current))
+}
+
+/// 用 GitHub 的 **API** 查（有限流，只当备胎）
+fn check_via_api(current: &str, agent: &str) -> UpdateCheck {
+    let body = match http_get_text(RELEASES_API, agent) {
         Ok(b) => b,
         Err(e) => return UpdateCheck::Failed(format!("{e:#}")),
     };
@@ -155,6 +204,41 @@ pub fn check(current: &str) -> UpdateCheck {
             .to_string(),
         download_url,
         size,
+    })
+}
+
+/// 从 `https://github.com/OWNER/REPO/releases/tag/v1.2.0` 里取出 `v1.2.0`
+///
+/// 认不出来就返回 `None` —— 宁可说"查失败"，也不要瞎猜一个版本号。
+fn tag_from_release_url(url: &str) -> Option<String> {
+    let rest = url.split_once("/releases/tag/")?.1;
+    // 后面还可能跟着 `?query`、`#fragment` 或者多余的斜杠
+    let tag = rest.split(['/', '?', '#']).next()?.trim();
+    (!tag.is_empty()).then(|| tag.to_string())
+}
+
+/// 拼出安装包的下载直链。
+///
+/// 例：`https://github.com/OWNER/REPO/releases/download/v1.2.0/PMCA-Installer.exe`
+///
+/// 网页那条路拿不到附件列表，但附件名是固定的（每次发布都叫这个），直接拼就行。
+fn asset_download_url(tag: &str) -> String {
+    format!("{REPO_URL}/releases/download/{tag}/{ASSET_NAME}")
+}
+
+/// 拿到 tag 之后，判断"有新版本"还是"已是最新"
+fn verdict_for_tag(tag: &str, current: &str) -> UpdateCheck {
+    let version = strip_v(tag);
+    if !is_newer(tag, current) {
+        return UpdateCheck::UpToDate { latest: version };
+    }
+    UpdateCheck::Available(NewVersion {
+        version,
+        page_url: format!("{REPO_URL}/releases/tag/{tag}"),
+        download_url: Some(asset_download_url(tag)),
+        // 网页这条路拿不到附件大小。
+        // 不影响进度条：真下载时以服务器给的 Content-Length 为准（见 download_to）。
+        size: None,
     })
 }
 
@@ -279,7 +363,7 @@ fn download_to(
     report: &mut dyn FnMut(Progress),
 ) -> Result<bool> {
     let agent = format!("PMCA-Installer/{}", crate::VERSION);
-    let request = GetRequest::send(url, &agent)?;
+    let request = GetRequest::send(url, &agent, true)?;
 
     // 优先用服务器给的长度，拿不到就用调用方传进来的（接口里那个 size）
     let total = request.content_length().unwrap_or(0);
@@ -392,8 +476,11 @@ struct GetRequest {
 impl GetRequest {
     /// 建会话、连服务器、发请求、收响应。
     ///
-    /// 失败（含 HTTP 状态码不是 200）都会返回 `Err`。
-    fn send(url: &str, agent: &str) -> Result<Self> {
+    /// `follow_redirects` 为 `false` 时**不**自动跟随跳转 —— 查版本要的就是那个
+    /// 302 本身（版本号在 `Location` 头里），这时 3xx 也算成功。
+    ///
+    /// 其余情况下失败（含 HTTP 状态码不是 200）都会返回 `Err`。
+    fn send(url: &str, agent: &str, follow_redirects: bool) -> Result<Self> {
         let (host, path) = split_url(url)?;
         let agent_w = to_wide(agent);
         let host_w = to_wide(host);
@@ -439,6 +526,18 @@ impl GetRequest {
                 bail!("构造请求失败");
             }
 
+            // 查版本那条路必须关掉自动跳转：否则 WinHTTP 会自己跟到网页上去，
+            // 我们要的 `Location` 就被它吃掉了
+            if !follow_redirects {
+                let off = WINHTTP_DISABLE_REDIRECTS;
+                WinHttpSetOption(
+                    request.0,
+                    WINHTTP_OPTION_DISABLE_FEATURE,
+                    (&raw const off).cast::<c_void>(),
+                    std::mem::size_of::<u32>() as u32,
+                );
+            }
+
             // GitHub 的接口要求带 User-Agent（WinHttpOpen 的 agent 已经提供了），
             // 再补一个 Accept 明确要 JSON
             let headers = to_wide("Accept: application/vnd.github+json\r\n");
@@ -464,6 +563,8 @@ impl GetRequest {
 
             match this.status_code() {
                 Some(200) => Ok(this),
+                // 关掉跳转时，3xx 是**预期**的：版本号就在 Location 里
+                Some(301 | 302 | 303 | 307 | 308) if !follow_redirects => Ok(this),
                 Some(404) => bail!("服务器说没有这个东西（404）"),
                 Some(other) => bail!("服务器返回 {other}"),
                 None => Ok(this), // 拿不到状态码就当作没出错，硬着头皮读
@@ -486,6 +587,34 @@ impl GetRequest {
             )
         };
         (ok != 0).then_some(status)
+    }
+
+    /// 3xx 响应里 `Location` 头指向的地址
+    fn location(&self) -> Option<String> {
+        let mut buf = [0u16; 1024];
+        let mut len = std::mem::size_of_val(&buf) as u32;
+        let ok = unsafe {
+            WinHttpQueryHeaders(
+                self.request.0,
+                WINHTTP_QUERY_LOCATION,
+                std::ptr::null(),
+                buf.as_mut_ptr().cast::<c_void>(),
+                &mut len,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return None;
+        }
+        // ⚠️ WinHTTP 这里给的是**字节数**，但到底含不含结尾的 0，
+        //    不同版本/不同头上并不一致。别猜 —— 按字节数取够，
+        //    再把结尾可能多出来的 0 剪掉就两种都对。
+        //    （真机踩过：这里多减一个字符，版本号最后一位会被吃掉，
+        //      于是 `v1.2.0` 变成 `1.2.`，解析失败 → 永远报"已是最新"。）
+        let chars = (len as usize / 2).min(buf.len());
+        let s = String::from_utf16_lossy(&buf[..chars]);
+        let s = s.trim_end_matches('\0').trim();
+        (!s.is_empty()).then(|| s.to_string())
     }
 
     /// 服务器声明的正文长度（`Content-Length`）。拿不到就是 `None`。
@@ -536,7 +665,7 @@ impl GetRequest {
 
 /// 发一个 HTTPS GET 并把正文当文本返回（用于查版本这种小响应）
 fn http_get_text(url: &str, agent: &str) -> Result<String> {
-    let request = GetRequest::send(url, agent)?;
+    let request = GetRequest::send(url, agent, true)?;
     let mut body = Vec::new();
     request.read_chunks(|chunk| {
         body.extend_from_slice(chunk);
@@ -567,6 +696,82 @@ fn to_wide(s: &str) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---------------- 查版本（不碰 API 的那条路）----------------
+
+    /// 从跳转地址里取出 tag
+    #[test]
+    fn tag_is_taken_from_the_release_url() {
+        assert_eq!(
+            tag_from_release_url("https://github.com/x/y/releases/tag/v1.2.0").as_deref(),
+            Some("v1.2.0")
+        );
+        // 后面跟着查询串 / 多余斜杠也能认
+        assert_eq!(
+            tag_from_release_url("https://github.com/x/y/releases/tag/v1.2.0?tab=readme").as_deref(),
+            Some("v1.2.0")
+        );
+        assert_eq!(
+            tag_from_release_url("https://github.com/x/y/releases/tag/v1.2.0/").as_deref(),
+            Some("v1.2.0")
+        );
+        // 认不出来就必须说认不出来，不能瞎猜一个版本号
+        assert_eq!(tag_from_release_url("https://github.com/x/y/releases"), None);
+        assert_eq!(tag_from_release_url("https://github.com/x/y"), None);
+        assert_eq!(
+            tag_from_release_url("https://github.com/x/y/releases/tag/"),
+            None
+        );
+    }
+
+    /// 拼出来的下载直链要正好指向本仓库的附件
+    #[test]
+    fn asset_url_points_at_this_repo() {
+        let url = asset_download_url("v1.2.0");
+        assert!(url.starts_with(REPO_URL), "{url}");
+        assert!(
+            url.ends_with("/releases/download/v1.2.0/PMCA-Installer.exe"),
+            "{url}"
+        );
+    }
+
+    /// 网页那条路给出的结论：有新版本要带上直链，否则就是"已是最新"
+    #[test]
+    fn verdict_from_tag_is_right() {
+        let expected = asset_download_url("v9.9.9");
+        match verdict_for_tag("v9.9.9", "1.2.1") {
+            UpdateCheck::Available(nv) => {
+                assert_eq!(nv.version, "9.9.9", "版本号要去掉开头的 v");
+                assert_eq!(nv.download_url.as_deref(), Some(expected.as_str()));
+                assert!(
+                    nv.page_url.contains("/releases/tag/v9.9.9"),
+                    "{}",
+                    nv.page_url
+                );
+            }
+            other => panic!("应判为发现新版本，实际 {other:?}"),
+        }
+
+        match verdict_for_tag("v1.0.0", "1.2.1") {
+            UpdateCheck::UpToDate { latest } => assert_eq!(latest, "1.0.0"),
+            other => panic!("应判为已是最新，实际 {other:?}"),
+        }
+    }
+
+    /// ⚠️ 回归测试：查版本用的必须是**网页**地址，
+    /// 不能是那个对没登录请求每小时只给 60 次的 API。
+    ///
+    /// 真事：用户被限流后接口回 403，检查更新就一直失败。
+    #[test]
+    fn version_check_does_not_use_the_rate_limited_api() {
+        assert!(
+            !RELEASES_PAGE.contains("api.github.com"),
+            "查版本不能走 API（没登录每小时只有 60 次）"
+        );
+        assert!(RELEASES_PAGE.contains(REPO_URL), "{RELEASES_PAGE}");
+        // API 常量还留着当备胎，但它得真的是 API 那个地址
+        assert!(RELEASES_API.contains("api.github.com"), "{RELEASES_API}");
+    }
 
     #[test]
     fn parses_versions_with_or_without_the_v() {
