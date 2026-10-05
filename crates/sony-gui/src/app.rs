@@ -39,6 +39,12 @@ const RECHECK_RETRY_DELAY: Duration = Duration::from_millis(1500);
 /// 重检最多试几次（含第一次）
 const RECHECK_MAX_ATTEMPTS: u8 = 4;
 
+/// 进度条每次刷新朝目标值挪多少（0–1 之间的比例）。
+///
+/// 下载线程每 120 毫秒才报一次进度，照搬的话进度条就是一格一格地跳。
+/// 每次只走一小段、慢慢追上去，看起来才像"在动"。
+const PROGRESS_EASE: f32 = 0.22;
+
 // ---------------------------------------------------------------- 状态
 
 /// 相机的检测状态。
@@ -99,6 +105,15 @@ struct Recheck {
 fn is_transient_miss_probe(probe: &sony_install::CameraProbe) -> bool {
     use sony_install::CameraProbe as P;
     matches!(probe, P::NotFound | P::Unreadable(_))
+}
+
+/// 从下载进度算出 0.0–1.0 的比例（总量未知时是 0）
+fn ratio_of(p: &crate::update::Progress) -> f32 {
+    if p.total > 0 {
+        (p.received as f32 / p.total as f32).clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
 }
 
 /// 安装处在哪一步
@@ -163,6 +178,12 @@ pub struct App {
     download_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// 装完之后预约的自动重检（见 `Recheck`）
     recheck: Option<Recheck>,
+    /// 「发现新版本」的弹窗开着吗
+    update_popup: bool,
+    /// 进度条**画出来**的数值（0.0–1.0）—— 平滑跟随真实进度
+    progress_shown: f32,
+    /// 下载线程刚报上来的真实进度
+    progress_target: f32,
 }
 
 /// 检查更新的状态
@@ -244,6 +265,8 @@ pub enum Message {
     CopyLog,
     /// 检查有没有新版本
     CheckUpdate,
+    /// 关掉「发现新版本」的弹窗（先不更新）
+    DismissUpdate,
     /// 开始下载新版本
     StartDownload,
     /// 取消下载
@@ -283,6 +306,9 @@ impl App {
             download_rx: None,
             download_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             recheck: None,
+            update_popup: false,
+            progress_shown: 0.0,
+            progress_target: 0.0,
             font_status,
         };
         match font_status {
@@ -354,6 +380,11 @@ impl App {
         // 把上一次的取消旗子清掉，否则新的下载一上来就会被取消
         self.download_cancel
             .store(false, std::sync::atomic::Ordering::Relaxed);
+        // 进度条从头开始，别接着上一次的数字
+        self.progress_shown = 0.0;
+        self.progress_target = 0.0;
+        // 已经开始下载了，提醒弹窗就收起来
+        self.update_popup = false;
 
         self.push_log(
             Level::Info,
@@ -376,6 +407,9 @@ impl App {
     fn on_download(&mut self, msg: WorkerMsg) {
         match msg {
             WorkerMsg::DownloadProgress(p) => {
+                // 只记下"目标值"，真正画多少由动画自己一步步追上去
+                // （见 tick_progress_animation）
+                self.progress_target = ratio_of(&p);
                 self.download = DownloadState::Running(p);
             }
             WorkerMsg::DownloadDone(outcome) => {
@@ -386,6 +420,9 @@ impl App {
                             Level::Good,
                             format!("下载完成：{}", path.display()),
                         );
+                        // 下完了进度条必须满格，不能停在动画的半路上
+                        self.progress_shown = 1.0;
+                        self.progress_target = 1.0;
                         self.download = DownloadState::Done(path);
                     }
                     crate::update::DownloadOutcome::Cancelled => {
@@ -498,6 +535,27 @@ impl App {
         }
     }
 
+    /// 每次 Tick 让进度条朝真实进度挪一小步 —— 这就是那个"动画"。
+    ///
+    /// 下载线程每 120 毫秒才报一次数，直接把数字画上去，进度条就是一格一格跳的；
+    /// 每次只走一小段、慢慢追上去，看起来才是连续在动。
+    fn tick_progress_animation(&mut self) {
+        if !matches!(self.download, DownloadState::Running(_)) {
+            return;
+        }
+        let gap = self.progress_target - self.progress_shown;
+        // 快贴上了就直接对齐，省得永远差那么一丁点
+        if gap.abs() < 0.002 {
+            self.progress_shown = self.progress_target;
+            return;
+        }
+        // 只朝目标走，不冲过头 —— 进度条往回缩看着很别扭
+        self.progress_shown += gap * PROGRESS_EASE;
+        if self.progress_shown > self.progress_target {
+            self.progress_shown = self.progress_target;
+        }
+    }
+
     fn begin_pick(&mut self) {
         if self.pick_rx.is_some() {
             return;
@@ -594,12 +652,20 @@ impl App {
                     self.begin_update_check();
                 }
             }
+            Message::DismissUpdate => {
+                self.update_popup = false;
+                self.push_log(Level::Info, "新版本提醒已关掉 —— 想更新时点右上角的按钮");
+            }
             Message::OpenReleasePage(url) => open_in_browser(&url),
             Message::OpenBrand(brand) => {
                 self.push_log(Level::Info, format!("打开{}：{}", brand.label(), brand.url()));
                 open_in_browser(brand.url());
             }
-            Message::StartDownload => self.begin_download(),
+            Message::StartDownload => {
+                // 弹窗要让位给下载对话框，不能两个叠在一起
+                self.update_popup = false;
+                self.begin_download();
+            }
             Message::CancelDownload => {
                 // 把旗子立起来，下载线程下一块数据就会停下
                 self.download_cancel
@@ -732,6 +798,8 @@ impl App {
         }
         // ---- 装完之后预约的自动重检 ----
         self.tick_recheck(Instant::now());
+        // ---- 进度条动画 ----
+        self.tick_progress_animation();
     }
 
     /// 检查更新的结果回来了
@@ -741,9 +809,12 @@ impl App {
             U::Available(nv) => {
                 self.push_log(
                     Level::Good,
-                    format!("发现新版本 v{} —— 点右上角「有新版本」去下载", nv.version),
+                    format!("发现新版本 v{} —— 弹窗提醒一下", nv.version),
                 );
                 self.update = UpdateState::Available(nv);
+                // 主动弹窗，而不是只把右上角按钮变个颜色：
+                // 用户这会儿多半在忙别的（插相机、挑 APK），那点变化很容易错过。
+                self.update_popup = true;
             }
             U::UpToDate { latest } => {
                 self.push_log(Level::Info, format!("已是最新版本（{latest}）"));
@@ -936,8 +1007,12 @@ impl App {
         // 下载对话框要**盖在整页上面**，所以用 stack 把两层叠起来。
         // 不用单独开一个窗口：那要管理窗口 id、生命周期、位置、关闭事件，
         // 而我们只是想挡住主界面一会儿。
+        // 两个浮层不会同时出现：下载对话框优先（它更需要用户盯着）。
         if self.download.is_open() {
             return stack![page, self.download_dialog()].into();
+        }
+        if self.update_popup {
+            return stack![page, self.update_popup_dialog()].into();
         }
         page.into()
     }
@@ -959,12 +1034,10 @@ impl App {
                 } else {
                     crate::update::human_bytes(p.received)
                 };
-                // 总量未知时进度条停在 0，下面的文字会说明已下了多少
-                let ratio = if p.total > 0 {
-                    (p.received as f32 / p.total as f32).clamp(0.0, 1.0)
-                } else {
-                    0.0
-                };
+                // 进度条画的是**平滑跟随**的那个值（见 tick_progress_animation），
+                // 而不是刚报上来的原始数字 —— 那样会一格一格地跳。
+                // 总量未知时它停在 0，下面的文字会说明已经下了多少。
+                let ratio = self.progress_shown;
 
                 column![
                     text("正在下载新版")
@@ -1111,21 +1184,69 @@ impl App {
             .into(),
         };
 
-        let dialog = container(card_body)
-            .padding(20)
-            .width(Length::Fixed(460.0))
-            .style(th::card);
+        overlay(card_body)
+    }
 
-        // 遮罩铺满整页、半透明，内容居中。
-        // 遮罩本身也吃掉了点击，所以下载时点不到下面的按钮。
-        container(dialog)
-            .padding(40)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .center_x(Length::Fill)
-            .center_y(Length::Fill)
-            .style(th::scrim)
-            .into()
+    /// 「发现新版本」的弹窗
+    ///
+    /// 为什么值得弹一下：用户开着这个窗口时多半在忙别的（插相机、挑 APK），
+    /// 右上角按钮上那点变化很容易被错过 —— 尤其是启动时自动查出来的那次。
+    fn update_popup_dialog(&self) -> Element<'_, Message> {
+        let UpdateState::Available(nv) = &self.update else {
+            return Space::new().into();
+        };
+
+        let size_line = match nv.size {
+            Some(s) => format!("安装包大约 {}", crate::update::human_bytes(s)),
+            None => "安装包大小要看服务器那边的说明".to_string(),
+        };
+        // 拿不到直链的版本只能开浏览器 —— 按钮上就直说，
+        // 别让用户以为点了会在程序里下载
+        let can_download = nv.download_url.is_some();
+
+        let buttons = row![
+            space::horizontal(),
+            button(
+                text("以后再说")
+                    .size(th::SIZE_CAPTION)
+                    .font(self.fonts.regular)
+            )
+            .padding([6, 14])
+            .style(th::secondary_button)
+            .on_press(Message::DismissUpdate),
+            button(
+                text(if can_download { "立即更新" } else { "打开发布页" })
+                    .size(th::SIZE_CAPTION)
+                    .font(self.fonts.bold)
+            )
+            .padding([6, 14])
+            .style(th::primary_button)
+            .on_press(Message::StartDownload),
+        ]
+        .spacing(8);
+
+        let body = column![
+            text("发现新版本")
+                .size(th::SIZE_HEADING)
+                .font(self.fonts.bold)
+                .color(th::TEXT),
+            text(format!(
+                "当前 v{} → 最新 v{}",
+                crate::VERSION,
+                nv.version
+            ))
+            .size(th::SIZE_BODY)
+            .font(self.fonts.regular)
+            .color(th::TEXT_WEAK),
+            text(size_line)
+                .size(th::SIZE_CAPTION)
+                .font(self.fonts.regular)
+                .color(th::TEXT_FAINT),
+            buttons,
+        ]
+        .spacing(10);
+
+        overlay(body.into())
     }
 
     /// 对话框里那句"从 x 到 y"
@@ -1562,6 +1683,25 @@ fn card<'a>(title: &'a str, fonts: Fonts, body: Element<'a, Message>) -> Element
     .into()
 }
 
+/// 盖在主界面上的那一层：半透明遮罩铺满整页，中间一张卡片。
+///
+/// 遮罩本身也吃掉点击，所以浮层开着的时候点不到下面的按钮。
+fn overlay<'a>(body: Element<'a, Message>) -> Element<'a, Message> {
+    let dialog = container(body)
+        .padding(20)
+        .width(Length::Fixed(460.0))
+        .style(th::card);
+
+    container(dialog)
+        .padding(40)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .center_x(Length::Fill)
+        .center_y(Length::Fill)
+        .style(th::scrim)
+        .into()
+}
+
 /// 提示条
 fn banner<'a>(
     fonts: Fonts,
@@ -1729,6 +1869,25 @@ mod tests {
             model: "ILCE-6300".into(),
             serial: "05130861".into(),
             app_install_mode: true,
+        })
+    }
+
+    /// 一个"服务器上有新版本"的假结果
+    fn new_version() -> crate::update::NewVersion {
+        crate::update::NewVersion {
+            version: "1.2.2".into(),
+            page_url: "https://example.invalid/releases".into(),
+            download_url: Some("https://example.invalid/PMCA-Installer.exe".into()),
+            size: Some(5_000_000),
+        }
+    }
+
+    /// 一个"正在下载"的假状态
+    fn running_progress() -> DownloadState {
+        DownloadState::Running(crate::update::Progress {
+            received: 0,
+            total: 100,
+            speed: 0.0,
         })
     }
 
@@ -1928,6 +2087,112 @@ mod tests {
             matches!(a.camera, Camera::Missing(_)),
             "没在重检时，查不到就该如实说"
         );
+    }
+
+    // ---------------- 检查更新 / 「发现新版本」弹窗 ----------------
+
+    /// 查到新版本要主动弹窗，而不是只把右上角按钮变个颜色
+    #[test]
+    fn update_popup_appears_when_a_new_version_is_found() {
+        let mut a = app();
+        assert!(!a.update_popup, "刚开始不该有弹窗");
+        a.on_update(crate::update::UpdateCheck::Available(new_version()));
+        assert!(a.update_popup, "查到新版本就该弹窗提醒");
+    }
+
+    /// 「以后再说」之后弹窗关掉
+    #[test]
+    fn dismiss_update_closes_the_popup() {
+        let mut a = app();
+        a.on_update(crate::update::UpdateCheck::Available(new_version()));
+        let _ = a.update(Message::DismissUpdate);
+        assert!(!a.update_popup, "点了「以后再说」就该关掉");
+    }
+
+    /// 点「立即更新」时弹窗要让位，不能和下载对话框叠在一起。
+    ///
+    /// ⚠️ 这里故意**不**让 update 处于 Available 状态 —— 否则会真的去连网下载
+    ///    （或者打开浏览器），单元测试不该干那种事。这条只关心弹窗收没收。
+    #[test]
+    fn starting_the_download_closes_the_popup() {
+        let mut a = app();
+        a.update_popup = true;
+        let _ = a.update(Message::StartDownload);
+        assert!(!a.update_popup, "开始下载后弹窗该收起来");
+    }
+
+    /// 已是最新、或者压根没查成，都不该弹窗 —— 没网是很正常的事，别吓人
+    #[test]
+    fn no_popup_when_there_is_nothing_to_say() {
+        let mut a = app();
+        a.on_update(crate::update::UpdateCheck::UpToDate {
+            latest: "1.2.1".into(),
+        });
+        assert!(!a.update_popup, "已是最新不该弹窗");
+
+        a.on_update(crate::update::UpdateCheck::Failed("没网".into()));
+        assert!(!a.update_popup, "查失败不该弹窗");
+    }
+
+    // ---------------- 进度条动画 ----------------
+
+    /// 进度条要"平滑追上去"，而不是照着数字一格一格跳
+    #[test]
+    fn progress_bar_eases_towards_the_real_value() {
+        let mut a = app();
+        a.download = running_progress();
+
+        // 下载线程报上来了 80%
+        a.on_download(WorkerMsg::DownloadProgress(crate::update::Progress {
+            received: 80,
+            total: 100,
+            speed: 1.0,
+        }));
+        assert!((a.progress_target - 0.8).abs() < 1e-6, "目标应是 0.8");
+
+        // 一次 Tick 只挪一小步 —— 这就是"动画"
+        a.tick_progress_animation();
+        let after_one = a.progress_shown;
+        assert!(
+            after_one > 0.0 && after_one < 0.8,
+            "应该朝目标挪一点，实际 {after_one}"
+        );
+
+        // 多来几次就贴上去了，而且不会冲过头
+        for _ in 0..80 {
+            a.tick_progress_animation();
+        }
+        assert!(
+            (a.progress_shown - 0.8).abs() < 0.01,
+            "最终要贴住真实值，实际 {}",
+            a.progress_shown
+        );
+        assert!(a.progress_shown <= 0.8 + 1e-6, "不能冲过头");
+    }
+
+    /// 下载完成时进度条必须满格，不能停在动画的半路上
+    #[test]
+    fn progress_bar_snaps_to_full_when_done() {
+        let mut a = app();
+        a.download = running_progress();
+        a.progress_shown = 0.3;
+        a.progress_target = 0.3;
+
+        a.on_download(WorkerMsg::DownloadDone(crate::update::DownloadOutcome::Done(
+            std::path::PathBuf::from("某处.exe"),
+        )));
+
+        assert_eq!(a.progress_shown, 1.0, "下完了进度条就得是满的");
+    }
+
+    /// 没在下载的时候，动画不该乱动进度条
+    #[test]
+    fn animation_does_nothing_when_not_downloading() {
+        let mut a = app();
+        a.progress_shown = 0.5;
+        a.progress_target = 0.9;
+        a.tick_progress_animation();
+        assert_eq!(a.progress_shown, 0.5, "没在下载就别动它");
     }
 
     #[test]
