@@ -351,13 +351,20 @@ fn classify_absent_camera() -> CameraProbe {
 /// 返回：
 /// - `Ok(true)`  —— 找到了海量存储器相机，并且切换成功
 /// - `Ok(false)` —— 压根没找到这种相机（调用方按"没插相机"处理）
-/// - `Err(..)`   —— 找到了但切不动（权限不够、相机不认这条命令…）
+/// - `Err(..)`   —— 找到了但切不动（权限不够、机型不支持…）
 ///
 /// # 为什么逐个分区试
 ///
 /// 真机实测：同一个相机上的多个分区**只有一个认这条命令**
 /// （α6300 上 SD 卡分区接受，`PMHOME` 小分区回 SCSI 状态 2）。
 /// 原项目是"取第一个"，这里改成**谁接受用谁**，更稳。
+///
+/// # 为什么失败后不直接甩一句"再试一个分区"
+///
+/// 老机型会回 `05/20/00（INVALID COMMAND OPERATION CODE）` —— 固件里
+/// 根本没这条命令（NEX-7 就是这样）。两个分区回的是同一句，
+/// 再劝用户"换个分区"只会让他去拔插、换线、提权，全是白费。
+/// 所以拒绝原因要分类，见 [`explain_switch_failure`]。
 fn switch_from_mass_storage(report: Reporter) -> Result<bool> {
     let devices = sony_usb::msc::list_sony_msc_devices();
     if devices.is_empty() {
@@ -372,7 +379,7 @@ fn switch_from_mass_storage(report: Reporter) -> Result<bool> {
         ),
     );
 
-    let mut last_error: Option<anyhow::Error> = None;
+    let mut failures: Vec<sony_usb::msc::SwitchError> = Vec::new();
     for d in &devices {
         match d.switch_to_app_install_mode() {
             Ok(()) => {
@@ -381,21 +388,117 @@ fn switch_from_mass_storage(report: Reporter) -> Result<bool> {
             }
             Err(e) => {
                 // 被某个分区拒绝很正常（那不是主存储分区），记进日志继续试下一个
-                sony_core::market::trace_diag(&format!(
-                    "[海量存储器] {} 拒绝：{e:#}",
-                    d.volume
-                ));
-                last_error = Some(e);
+                sony_core::market::trace_diag(&format!("[海量存储器] {} 拒绝：{e}", d.volume));
+                failures.push(e);
             }
         }
     }
 
-    Err(last_error
-        .unwrap_or_else(|| anyhow::anyhow!("没有可用的分区"))
-        .context(
-            "相机在「海量存储器」模式下，但没有一个分区接受切换命令。\n\
-             如果提示「拒绝访问」，请以管理员身份重新运行本程序。",
-        ))
+    Err(explain_switch_failure(&failures))
+}
+
+/// 把所有分区都被拒绝这件事，翻译成一句**能照着做**的话。
+///
+/// 以前这里一律说"试试另一个分区 / 以管理员身份重跑"，三种完全不同的
+/// 情况被混成了一句，其中两种的指引是错的：
+///
+/// | 相机回的话 | 真实原因 | 该怎么办 |
+/// |---|---|---|
+/// | `05/20/00` INVALID OPCODE | 机型固件里没有这套东西 | 换机型，做什么都没用 |
+/// | `07/27/00` WRITE PROTECTED | SD 卡写了保护 | 拨开卡上的 LOCK |
+/// | 打不开卷 / Win32 5 | 权限或别的程序占着 | 提权、关掉占用程序 |
+fn explain_switch_failure(failures: &[sony_usb::msc::SwitchError]) -> anyhow::Error {
+    use sony_usb::msc::{Rejection, SwitchError};
+
+    if failures.is_empty() {
+        return anyhow::anyhow!("没有可用的分区");
+    }
+
+    // ---- ① 相机说它不认识这条命令 → 机型本身装不了应用 ----
+    //
+    // 只要有一个分区明确回"没有这个操作码"，这条路就走不通：
+    // 换分区、换 USB 口、提权都不会改变固件里的操作码表。
+    if failures.iter().any(|f| {
+        matches!(
+            f,
+            SwitchError::Rejected { rejection, .. } if rejection.means_unsupported()
+        )
+    }) {
+        return anyhow::anyhow!(
+            "这台相机不接受「切到安装模式」的命令 —— 它的固件里没有这条命令。\n\
+             \n\
+             相机回的是 SCSI sense 05/20/00（INVALID COMMAND OPERATION CODE），\n\
+             意思是「我没有这个操作码」。这和权限、分区、USB 口都无关，\n\
+             换线、拔插、以管理员身份重跑，结果都一样。\n\
+             \n\
+             能装 APK 的机型需要支持 PlayMemories Camera Apps\n\
+             （相机菜单里要有「应用程序列表」这一项），例如：\n\
+             α5000 / α5100 / α6000 / α6300 / α6500、α7 系列、NEX-5R / NEX-5T / NEX-6。\n\
+             NEX-7、NEX-5N、α7 III 这类机型没有这套子系统，装不了。\n\
+             \n\
+             如果确认自己的机型在支持列表里，可以再试两步：\n\
+             ① 把相机的 USB 连接方式改回「MTP」，拔插一次数据线 ——\n\
+                有些机型只在 MTP 模式下认这条命令（那样走的就是另一条路）\n\
+             ② 把相机固件升级到最新\n\
+             \n\
+             各分区的回复：\n{}",
+            describe_failures(failures)
+        );
+    }
+
+    // ---- ② 打不开卷 / 发不出命令 → 权限或占用 ----
+    if failures
+        .iter()
+        .any(|f| matches!(f, SwitchError::AccessDenied { .. }))
+    {
+        return anyhow::anyhow!(
+            "打不开相机的磁盘（拒绝访问），切换命令发不出去。\n\
+             \n\
+             这不是相机的问题，是 Windows 不让程序写这块盘：\n\
+             ① 以管理员身份重新运行本程序\n\
+             ② 关掉可能占用相机的程序（资源管理器预览、照片应用、原版 PMCA）\n\
+             \n\
+             各分区的回复：\n{}",
+            describe_failures(failures)
+        );
+    }
+
+    // ---- ③ 卡写了保护 ----
+    if failures.iter().any(|f| {
+        matches!(
+            f,
+            SwitchError::Rejected {
+                rejection: Rejection::WriteProtected,
+                ..
+            }
+        )
+    }) {
+        return anyhow::anyhow!(
+            "相机的存储卡是写保护的，切换命令被拒绝了。\n\
+             请把 SD 卡侧面的 LOCK 开关拨到可写，或者换一张卡，然后重试。\n\
+             \n\
+             各分区的回复：\n{}",
+            describe_failures(failures)
+        );
+    }
+
+    // ---- ④ 其它：如实转达相机的话，给一次拔插的机会 ----
+    anyhow::anyhow!(
+        "相机拒绝了「切到安装模式」的命令，没能进入安装模式。\n\
+         请把 USB 线拔下再插上，然后重试；仍然不行的话，把下面的内容发给作者。\n\
+         \n\
+         各分区的回复：\n{}",
+        describe_failures(failures)
+    )
+}
+
+/// 每个分区的拒绝原因，一行一条（只进日志/错误详情）
+fn describe_failures(failures: &[sony_usb::msc::SwitchError]) -> String {
+    failures
+        .iter()
+        .map(|f| format!("· {f}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// 找相机；如果不在应用安装模式，就**命令相机自己切过去**。
@@ -844,5 +947,68 @@ mod tests {
             ..s
         };
         assert!(s.mode_text().contains("普通模式"));
+    }
+
+    /// NEX-7 真机：两个分区都回 `05/20/00`（固件里没有这条命令）
+    ///
+    /// 这种情况必须说"机型不支持"，**不能**再说"换个分区试试"或
+    /// "以管理员身份重跑" —— 那两条路对用户是纯消耗。
+    #[test]
+    fn unsupported_firmware_is_reported_as_unsupported_not_as_permissions() {
+        use sony_usb::msc::{Rejection, SwitchError};
+        let rejected = |volume: &str| SwitchError::Rejected {
+            volume: volume.into(),
+            scsi_status: 0x02,
+            key: 0x05,
+            asc: 0x20,
+            ascq: 0x00,
+            rejection: Rejection::NoSuchCommand,
+        };
+        let msg = explain_switch_failure(&[rejected("\\\\.\\F:"), rejected("\\\\.\\G:")])
+            .to_string();
+
+        assert!(msg.contains("05/20/00"), "要把相机的原话摆出来：{msg}");
+        assert!(msg.contains("固件"), "要说清是固件里没有这条命令：{msg}");
+        assert!(msg.contains("PlayMemories"), "要说明支持条件：{msg}");
+        assert!(
+            !msg.contains("试试另一个"),
+            "两个分区回的是同一句，别让人白折腾：{msg}"
+        );
+        assert!(
+            !msg.contains("请以管理员身份"),
+            "这不是权限问题：{msg}"
+        );
+        // 第一行要能单独当标题用（界面上只显示第一行）
+        let first = msg.lines().next().unwrap();
+        assert!(first.contains("这台相机"), "第一行要能独立成句：{first}");
+    }
+
+    /// 打不开卷 = 权限/占用，和相机无关
+    #[test]
+    fn access_denied_points_at_permissions_not_at_the_camera() {
+        use sony_usb::msc::SwitchError;
+        let msg = explain_switch_failure(&[SwitchError::AccessDenied {
+            volume: "\\\\.\\F:".into(),
+        }])
+        .to_string();
+        assert!(msg.contains("管理员"), "要给出提权的做法：{msg}");
+        assert!(!msg.contains("不支持"), "别把权限问题说成机型问题：{msg}");
+    }
+
+    /// 卡写了保护是第三种情况，别混进"不支持"
+    #[test]
+    fn write_protected_card_gets_its_own_advice() {
+        use sony_usb::msc::{Rejection, SwitchError};
+        let msg = explain_switch_failure(&[SwitchError::Rejected {
+            volume: "\\\\.\\F:".into(),
+            scsi_status: 0x02,
+            key: 0x07,
+            asc: 0x27,
+            ascq: 0x00,
+            rejection: Rejection::WriteProtected,
+        }])
+        .to_string();
+        assert!(msg.contains("LOCK"), "要指到卡上的锁：{msg}");
+        assert!(!msg.contains("不支持"), "写保护不是机型不支持：{msg}");
     }
 }

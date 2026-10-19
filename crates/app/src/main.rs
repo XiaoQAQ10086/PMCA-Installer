@@ -92,7 +92,12 @@ fn msc_probe(action: Option<&str>) -> Result<()> {
             }
         }
     }
-    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("所有分区都试过了，都没成功")))
+    // 这里只做真机验证，直接把最后一个错误抛出去即可；
+    // 给用户看的措辞在 `sony_install` 里（那边要按拒绝原因分类）。
+    match last_err {
+        Some(e) => Err(anyhow::Error::new(e)),
+        None => Err(anyhow::anyhow!("所有分区都试过了，都没成功")),
+    }
 }
 
 /// 把 APK 安装到相机上。

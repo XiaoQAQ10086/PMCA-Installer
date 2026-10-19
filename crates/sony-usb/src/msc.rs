@@ -26,6 +26,11 @@
 //! 2. **相机的两个分区只有一个认这条命令。** α6300 上 SD 卡分区（F:）
 //!    接受、`PMHOME` 小分区（G:）拒绝。原项目是"取第一个"，
 //!    这里改成**逐个试，谁接受用谁**。
+//! 3. **机型太老会连命令都不认。** NEX-7（2011 年）真机回报的是
+//!    `sense 05/20/00（INVALID COMMAND OPERATION CODE）` —— 意思是
+//!    "我没有这个操作码"，而不是"这个分区不行"。那代机型没有
+//!    PlayMemories Camera Apps 子系统，再怎么换分区、提权、拔插都没用。
+//!    所以错误必须**分类型**往外报，见 [`Rejection`]、[`SwitchError`]。
 //!
 //! # 权限
 //!
@@ -33,10 +38,11 @@
 //! 是否适用）。这里不假设，而是**让调用方拿到明确的错误**：
 //! [`switch_to_app_install_mode`] 会把"拒绝访问"单独识别出来。
 
-use anyhow::{Context, Result, bail};
 use core::ffi::c_void;
 use std::thread::sleep;
 use std::time::Duration;
+
+use thiserror::Error;
 
 use windows_sys::Win32::Foundation::{
     CloseHandle, GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE, INVALID_HANDLE_VALUE,
@@ -52,6 +58,13 @@ use windows_sys::Win32::System::WindowsProgramming::DRIVE_REMOVABLE;
 /// windows-sys 里没有这个常量和配套结构体，所以在本文件里自己定义。
 /// 结构与 `ntddscsi.h` 一致。
 const IOCTL_SCSI_PASS_THROUGH_DIRECT: u32 = 0x0004_D014;
+
+/// `IOCTL_SCSI_GET_ADDRESS`：问这个卷在 SCSI 里的 PathId / TargetId / **Lun**。
+///
+/// ⚠️ 为什么非问不可：同一个相机的两个分区在海量存储器模式下是**两个 LUN**。
+/// 直通命令里的 `lun` 如果写死 0，对第二个分区发的命令其实还是发给 LUN 0 ——
+/// "逐个分区试"就变成了对同一个分区试两遍。
+const IOCTL_SCSI_GET_ADDRESS: u32 = 0x0004_1018;
 
 /// 数据方向：我们要**写**给相机
 const SCSI_IOCTL_DATA_OUT: u8 = 0;
@@ -110,6 +123,17 @@ struct ScsiPassThroughDirectWithBuffer {
     sense: [u8; SENSE_LEN],
 }
 
+/// `SCSI_ADDRESS`（`ntddscsi.h`，x64 上 8 字节）
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ScsiAddress {
+    length: u32,
+    port_number: u8,
+    path_id: u8,
+    target_id: u8,
+    lun: u8,
+}
+
 const SENSE_LEN: usize = 32;
 
 /// 一次 SCSI 命令的结果
@@ -143,6 +167,111 @@ impl ScsiOutcome {
     }
 }
 
+/// 相机拒绝「切换命令」的原因
+///
+/// ⚠️ 分出这些类型不是为了好看，是为了**别把用户带错方向**：
+/// NEX-7 真机回报 `05/20/00`（不认识这条命令），旧版却提示
+/// "这个分区可能不是主存储分区，试试另一个" —— 而两个分区回的是同一句。
+/// 用户于是开始拔插、换 USB 口、提权重跑，全是白费。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rejection {
+    /// `05/20` —— 固件里没有这个操作码。机型本身没有这套东西，试什么都没用。
+    NoSuchCommand,
+    /// `05/24`、`05/26` —— 命令认，但 CDB / 数据头不合它的要求（是我们发错了）
+    BadCommand,
+    /// `07/27` —— 介质写保护（SD 卡侧面的 LOCK 开关、或卡被锁）
+    WriteProtected,
+    /// `02/3A` —— 没有介质（海量存储器模式下就是**没插存储卡**）
+    NoMedium,
+    /// 不在上面这些里
+    Other,
+}
+
+impl Rejection {
+    /// 从 `(key, asc, ascq)` 判断原因
+    pub fn classify(sense: (u8, u8, u8)) -> Self {
+        match sense {
+            // INVALID COMMAND OPERATION CODE
+            (0x05, 0x20, _) => Self::NoSuchCommand,
+            // INVALID FIELD IN CDB / INVALID FIELD IN PARAMETER LIST
+            (0x05, 0x24, _) | (0x05, 0x26, _) => Self::BadCommand,
+            // WRITE PROTECTED
+            (0x07, 0x27, _) => Self::WriteProtected,
+            // MEDIUM NOT PRESENT
+            (0x02, 0x3A, _) => Self::NoMedium,
+            _ => Self::Other,
+        }
+    }
+
+    /// 这个原因是不是在说"整台相机都不认这条命令"，而不是"这个分区不行"
+    pub fn means_unsupported(self) -> bool {
+        matches!(self, Self::NoSuchCommand)
+    }
+}
+
+impl std::fmt::Display for Rejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::NoSuchCommand => "固件里没有这条命令（INVALID COMMAND OPERATION CODE）",
+            Self::BadCommand => "命令参数不被接受（INVALID FIELD）",
+            Self::WriteProtected => "介质写保护",
+            Self::NoMedium => "没有可用的存储介质（相机里插卡了吗）",
+            Self::Other => "原因不明",
+        })
+    }
+}
+
+/// 「切到应用安装模式」失败的**具体**原因
+///
+/// 和 `anyhow` 的字符串错误不同：上层要靠类型区分
+/// "权限不够" / "机型不支持" / "卡写保护"，才能给出对得上的提示。
+#[derive(Debug, Error)]
+pub enum SwitchError {
+    /// 打开卷被系统拒绝（Win32 5）。和相机无关，是权限或占用问题。
+    #[error("打不开 {volume}：拒绝访问")]
+    AccessDenied { volume: String },
+
+    /// 打不开卷，其它 Windows 错误
+    #[error("打不开 {volume}（Win32 错误 {code}）")]
+    OpenFailed { volume: String, code: u32 },
+
+    /// 卷打开了，但直通命令发不出去
+    #[error("向 {volume} 发命令失败（Win32 错误 {code}）")]
+    IoFailed { volume: String, code: u32 },
+
+    /// 命令发出去了，相机明确拒绝
+    #[error(
+        "相机拒绝了切换命令（{volume}）：SCSI 状态 0x{scsi_status:02x}，\
+         sense {key:02x}/{asc:02x}/{ascq:02x}，{rejection}"
+    )]
+    Rejected {
+        volume: String,
+        scsi_status: u8,
+        key: u8,
+        asc: u8,
+        ascq: u8,
+        rejection: Rejection,
+    },
+
+    /// 相机一直忙
+    #[error("相机一直回报「设备忙」，重试 {attempts} 次后放弃（{volume}）")]
+    BusyTimeout { volume: String, attempts: usize },
+}
+
+/// 这个 sense 是不是"稍后会好"，值得重试
+///
+/// - `09/81/81`：设备忙（原项目在这里死循环）
+/// - `06/29/*`：上电/复位后的 UNIT ATTENTION
+/// - `06/28/*`：介质换过（刚插卡）
+/// - `02/04/*`：正在变成就绪
+fn is_retryable_sense(sense: (u8, u8, u8)) -> bool {
+    sense == SENSE_DEVICE_BUSY
+        || matches!(
+            sense,
+            (0x06, 0x29, _) | (0x06, 0x28, _) | (0x02, 0x04, _)
+        )
+}
+
 /// 一台处于「海量存储器」模式的索尼相机
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SonyMscDevice {
@@ -157,71 +286,59 @@ impl SonyMscDevice {
     ///
     /// 成功后再枚举设备，它就会变成一个 MTP 的应用安装模式设备，
     /// 后面走普通的 MTP 流程即可。
-    pub fn switch_to_app_install_mode(&self) -> Result<()> {
+    /// 失败时返回的是**分好类的** [`SwitchError`]，不是一句话：
+    /// "机型不认这条命令"和"这个分区不认"必须能分开，否则上层只能瞎猜。
+    pub fn switch_to_app_install_mode(&self) -> Result<(), SwitchError> {
         let mut payload = build_dlmode_payload();
         let cdb = build_ext_cmd_cdb(DLMODE_GROUP);
 
-        let mut last: Option<(u8, u8, u8)> = None;
         for _attempt in 1..=MAX_BUSY_RETRY {
-            let outcome = self
-                .send_scsi(&cdb, SCSI_IOCTL_DATA_OUT, &mut payload)
-                .with_context(|| format!("向 {} 发切换命令失败", self.volume))?;
+            let outcome = self.send_scsi(&cdb, SCSI_IOCTL_DATA_OUT, &mut payload)?;
 
             if outcome.is_ok() {
                 return Ok(());
             }
             let sense = outcome.sense_tuple();
-            if sense == SENSE_DEVICE_BUSY {
-                last = Some(sense);
+            if is_retryable_sense(sense) {
                 sleep(BUSY_RETRY_DELAY);
                 continue;
             }
-            // 拒绝访问单独说清楚：这是**权限问题**，不是相机问题。
-            // 上层可以据此提示"以管理员身份重试"，而不是让用户去折腾相机。
-            if let Some(e) = access_denied_hint() {
-                bail!(
-                    "向 {} 发命令时被系统拒绝（{e}）。\n\
-                     这通常是权限问题，需要以管理员身份运行。\n\
-                     SCSI 状态 {:#04x}，sense {:02x} {:02x} {:02x}",
-                    self.volume,
-                    outcome.scsi_status,
-                    sense.0,
-                    sense.1,
-                    sense.2
-                );
-            }
-            bail!(
-                "相机拒绝了切换命令（{}）。\n\
-                 SCSI 状态 {:#04x}，sense {:02x} {:02x} {:02x}\n\
-                 这个分区可能不是相机的主存储分区，试试另一个。",
-                self.volume,
-                outcome.scsi_status,
-                sense.0,
-                sense.1,
-                sense.2
-            );
+            return Err(SwitchError::Rejected {
+                volume: self.volume.clone(),
+                scsi_status: outcome.scsi_status,
+                key: sense.0,
+                asc: sense.1,
+                ascq: sense.2,
+                rejection: Rejection::classify(sense),
+            });
         }
-        bail!(
-            "相机一直回报「设备忙」，重试 {} 次后放弃（最后 sense {:02x?}）。",
-            MAX_BUSY_RETRY,
-            last
-        )
+        Err(SwitchError::BusyTimeout {
+            volume: self.volume.clone(),
+            attempts: MAX_BUSY_RETRY,
+        })
     }
 
     /// 打开卷并发一条 SCSI 直通命令
     ///
     /// `buffer` 对写方向是"要发的数据"，对读方向是"收数据的缓冲区"，
     /// 所以统一用 `&mut`。
-    fn send_scsi(&self, cdb: &[u8], direction: u8, buffer: &mut [u8]) -> Result<ScsiOutcome> {
+    fn send_scsi(
+        &self,
+        cdb: &[u8],
+        direction: u8,
+        buffer: &mut [u8],
+    ) -> Result<ScsiOutcome, SwitchError> {
         let handle = open_volume(&self.volume)?;
+        // 问清楚这个卷是哪个 LUN —— 问不到就用 0（单 LUN 设备上二者相同）
+        let address = query_address(handle);
 
         let mut with_buffer = ScsiPassThroughDirectWithBuffer {
             sptd: ScsiPassThroughDirect {
                 length: core::mem::size_of::<ScsiPassThroughDirect>() as u16,
                 scsi_status: 0,
-                path_id: 0,
-                target_id: 0,
-                lun: 0,
+                path_id: address.map_or(0, |a| a.path_id),
+                target_id: address.map_or(0, |a| a.target_id),
+                lun: address.map_or(0, |a| a.lun),
                 cdb_length: cdb.len() as u8,
                 sense_info_length: SENSE_LEN as u8,
                 data_in: direction,
@@ -259,8 +376,18 @@ impl SonyMscDevice {
 
         if ok == 0 {
             // ⚠️ 错误号要在这里读出来再带上，别只留一句"调用失败"。
-            //    上层要靠 5（拒绝访问）来区分"权限不够"和"相机不认"。
-            bail!("DeviceIoControl 失败（Win32 错误 {last_error}）");
+            //    5（拒绝访问）要单独分类 —— 上层据此提示"以管理员身份重试"，
+            //    而不是让用户去折腾相机。
+            return Err(if last_error == 5 {
+                SwitchError::AccessDenied {
+                    volume: self.volume.clone(),
+                }
+            } else {
+                SwitchError::IoFailed {
+                    volume: self.volume.clone(),
+                    code: last_error,
+                }
+            });
         }
 
         Ok(ScsiOutcome {
@@ -270,12 +397,20 @@ impl SonyMscDevice {
     }
 
     /// 发一条标准 `INQUIRY`，拿厂商和型号
-    fn inquiry(&self) -> Result<(String, String)> {
+    fn inquiry(&self) -> Result<(String, String), SwitchError> {
         let cdb = [0x12u8, 0x00, 0x00, 0x00, 36, 0x00];
         let mut buf = [0u8; 36];
         let outcome = self.send_scsi(&cdb, SCSI_IOCTL_DATA_IN, &mut buf)?;
         if !outcome.is_ok() {
-            bail!("INQUIRY 被拒绝（SCSI 状态 {:#04x}）", outcome.scsi_status);
+            let sense = outcome.sense_tuple();
+            return Err(SwitchError::Rejected {
+                volume: self.volume.clone(),
+                scsi_status: outcome.scsi_status,
+                key: sense.0,
+                asc: sense.1,
+                ascq: sense.2,
+                rejection: Rejection::classify(sense),
+            });
         }
         // 响应布局：8 字节头 + 8 字节厂商 + 16 字节型号 + 4 字节版本
         let vendor = ascii_trim(&buf[8..16]);
@@ -364,7 +499,7 @@ fn build_ext_cmd_cdb(group: u32) -> [u8; 12] {
 ///
 /// ⚠️ **必须带 `GENERIC_WRITE`。** 只读打开是能成功的，但接下来一发
 /// SCSI 直通就会回"拒绝访问"（Win32 5）—— 真机上验过。
-fn open_volume(volume: &str) -> Result<HANDLE> {
+fn open_volume(volume: &str) -> Result<HANDLE, SwitchError> {
     let path = to_wide(volume);
     let handle = unsafe {
         CreateFileW(
@@ -379,28 +514,46 @@ fn open_volume(volume: &str) -> Result<HANDLE> {
     };
     if handle == INVALID_HANDLE_VALUE || handle.is_null() {
         let err = unsafe { GetLastError() };
-        if err == 5 {
-            bail!(
-                "打不开 {volume}：拒绝访问。\n\
-                 这需要管理员权限 —— 请以管理员身份重新运行本程序。"
-            );
-        }
-        bail!("打不开 {volume}（Win32 错误 {err}）");
+        return Err(if err == 5 {
+            SwitchError::AccessDenied {
+                volume: volume.to_string(),
+            }
+        } else {
+            SwitchError::OpenFailed {
+                volume: volume.to_string(),
+                code: err,
+            }
+        });
     }
     Ok(handle)
 }
 
-/// 刚才那次失败是不是"权限不足"。
+/// 问这个卷在 SCSI 里的 PathId / TargetId / Lun。
 ///
-/// 单看返回值不够（`DeviceIoControl` 只回 0/非 0），所以直接查
-/// 线程最后的错误号。
-fn access_denied_hint() -> Option<String> {
-    let err = unsafe { GetLastError() };
-    if err == 5 {
-        Some("拒绝访问".to_string())
-    } else {
-        None
-    }
+/// 问不到就返回 `None`，调用方退回全 0 —— 单 LUN 设备上那是等价的，
+/// 所以失败**不算错误**，不能因此让整个切换失败。
+fn query_address(handle: HANDLE) -> Option<ScsiAddress> {
+    let mut address = ScsiAddress {
+        length: core::mem::size_of::<ScsiAddress>() as u32,
+        port_number: 0,
+        path_id: 0,
+        target_id: 0,
+        lun: 0,
+    };
+    let mut returned: u32 = 0;
+    let ok = unsafe {
+        DeviceIoControl(
+            handle,
+            IOCTL_SCSI_GET_ADDRESS,
+            std::ptr::null_mut(),
+            0,
+            (&raw mut address).cast::<c_void>(),
+            core::mem::size_of::<ScsiAddress>() as u32,
+            &mut returned,
+            std::ptr::null_mut(),
+        )
+    };
+    (ok != 0).then_some(address)
 }
 
 fn to_wide(s: &str) -> Vec<u16> {
@@ -504,6 +657,69 @@ mod tests {
             core::mem::size_of::<ScsiPassThroughDirectWithBuffer>(),
             96,
             "整体 96 字节"
+        );
+        assert_eq!(
+            core::mem::size_of::<ScsiAddress>(),
+            8,
+            "SCSI_ADDRESS 是 8 字节"
+        );
+        assert_eq!(core::mem::offset_of!(ScsiAddress, lun), 7, "Lun 在偏移 7");
+    }
+
+    /// 真机（NEX-7）回来的那句必须被认成"固件里没有这条命令"
+    ///
+    /// 日志原文：`SCSI 状态0x02，sense 052000`。
+    #[test]
+    fn nex7_real_world_rejection_is_invalid_opcode() {
+        let sense = (0x05, 0x20, 0x00);
+        assert_eq!(Rejection::classify(sense), Rejection::NoSuchCommand);
+        assert!(
+            Rejection::classify(sense).means_unsupported(),
+            "整台相机都不认这条命令，不是分区的问题"
+        );
+        // 不能当成"设备忙"去重试 —— 重试一万次也还是这个答案
+        assert!(!is_retryable_sense(sense));
+    }
+
+    #[test]
+    fn rejection_kinds_are_told_apart() {
+        assert_eq!(Rejection::classify((0x05, 0x24, 0x00)), Rejection::BadCommand);
+        assert_eq!(Rejection::classify((0x05, 0x26, 0x00)), Rejection::BadCommand);
+        assert_eq!(
+            Rejection::classify((0x07, 0x27, 0x00)),
+            Rejection::WriteProtected
+        );
+        assert_eq!(Rejection::classify((0x02, 0x3A, 0x00)), Rejection::NoMedium);
+        assert_eq!(Rejection::classify((0x04, 0x00, 0x00)), Rejection::Other);
+    }
+
+    #[test]
+    fn transient_senses_are_retried() {
+        assert!(is_retryable_sense(SENSE_DEVICE_BUSY), "设备忙要重试");
+        assert!(is_retryable_sense((0x06, 0x29, 0x00)), "复位后的 UNIT ATTENTION 要重试");
+        assert!(is_retryable_sense((0x02, 0x04, 0x00)), "正在就绪要重试");
+        // "没有介质"和"不认命令"都是终局答案，重试只是拖时间
+        assert!(!is_retryable_sense((0x02, 0x3A, 0x00)));
+        assert!(!is_retryable_sense((0x05, 0x20, 0x00)));
+    }
+
+    /// 错误文字里必须有判据，而且**不能再劝用户换个分区试试**
+    #[test]
+    fn rejection_message_states_the_sense_code_and_drops_the_wrong_advice() {
+        let e = SwitchError::Rejected {
+            volume: "\\\\.\\D:".into(),
+            scsi_status: 0x02,
+            key: 0x05,
+            asc: 0x20,
+            ascq: 0x00,
+            rejection: Rejection::NoSuchCommand,
+        };
+        let text = e.to_string();
+        assert!(text.contains("05/20/00"), "要把 sense 摆出来：{text}");
+        assert!(text.contains("INVALID COMMAND"), "要说清它是什么意思：{text}");
+        assert!(
+            !text.contains("试试另一个"),
+            "两个分区回的是同一句，别让人白折腾：{text}"
         );
     }
 }
