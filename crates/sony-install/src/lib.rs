@@ -399,14 +399,25 @@ fn switch_from_mass_storage(report: Reporter) -> Result<bool> {
 
 /// 把所有分区都被拒绝这件事，翻译成一句**能照着做**的话。
 ///
-/// 以前这里一律说"试试另一个分区 / 以管理员身份重跑"，三种完全不同的
-/// 情况被混成了一句，其中两种的指引是错的：
+/// 三种情况的处理完全不同，之前被混成了一句（"试试另一个分区 / 以管理员
+/// 身份重跑"）：
 ///
 /// | 相机回的话 | 真实原因 | 该怎么办 |
 /// |---|---|---|
-/// | `05/20/00` INVALID OPCODE | 机型固件里没有这套东西 | 换机型，做什么都没用 |
-/// | `07/27/00` WRITE PROTECTED | SD 卡写了保护 | 拨开卡上的 LOCK |
 /// | 打不开卷 / Win32 5 | 权限或别的程序占着 | 提权、关掉占用程序 |
+/// | `07/27/00` WRITE PROTECTED | SD 卡写了保护 | 拨开卡上的 LOCK |
+/// | `02/3A/00` MEDIUM NOT PRESENT | 没插卡 | 插卡再拔插 |
+/// | `05/20/00` INVALID OPCODE | 固件不认这条命令 | 见下面的说明 |
+///
+/// # 关于 `05/20/00`：**别急着说"这台机型不支持"**
+///
+/// 1.3.1 在这里栽过：只要**有一个**分区回了 05/20 就下"机型不支持"的结论，
+/// α6000 用户看到的就是"你的相机需要支持 PMCA" —— 而 α6000 明明支持
+/// （官方机型表 apps 2.4）。
+///
+/// 相机有两个分区（卡 + `PMHOME` 小分区），后者本来就经常回 05/20
+/// （α6300 实测它就是拒绝的）。只要**卡那个分区**回的是别的原因，
+/// 就不是机型的问题。所以这里必须用 `all`，不能用 `any`。
 fn explain_switch_failure(failures: &[sony_usb::msc::SwitchError]) -> anyhow::Error {
     use sony_usb::msc::{Rejection, SwitchError};
 
@@ -414,39 +425,23 @@ fn explain_switch_failure(failures: &[sony_usb::msc::SwitchError]) -> anyhow::Er
         return anyhow::anyhow!("没有可用的分区");
     }
 
-    // ---- ① 相机说它不认识这条命令 → 机型本身装不了应用 ----
-    //
-    // 只要有一个分区明确回"没有这个操作码"，这条路就走不通：
-    // 换分区、换 USB 口、提权都不会改变固件里的操作码表。
-    if failures.iter().any(|f| {
-        matches!(
-            f,
-            SwitchError::Rejected { rejection, .. } if rejection.means_unsupported()
-        )
-    }) {
-        return anyhow::anyhow!(
-            "这台相机不接受「切到安装模式」的命令 —— 它的固件里没有这条命令。\n\
-             \n\
-             相机回的是 SCSI sense 05/20/00（INVALID COMMAND OPERATION CODE），\n\
-             意思是「我没有这个操作码」。这和权限、分区、USB 口都无关，\n\
-             换线、拔插、以管理员身份重跑，结果都一样。\n\
-             \n\
-             能装 APK 的机型需要支持 PlayMemories Camera Apps\n\
-             （相机菜单里要有「应用程序列表」这一项），例如：\n\
-             α5000 / α5100 / α6000 / α6300 / α6500、α7 系列、NEX-5R / NEX-5T / NEX-6。\n\
-             NEX-7、NEX-5N、α7 III 这类机型没有这套子系统，装不了。\n\
-             \n\
-             如果确认自己的机型在支持列表里，可以再试两步：\n\
-             ① 把相机的 USB 连接方式改回「MTP」，拔插一次数据线 ——\n\
-                有些机型只在 MTP 模式下认这条命令（那样走的就是另一条路）\n\
-             ② 把相机固件升级到最新\n\
-             \n\
-             各分区的回复：\n{}",
-            describe_failures(failures)
-        );
+    /// 是不是**每一个**分区都给了这个回复
+    fn all_say(
+        failures: &[sony_usb::msc::SwitchError],
+        pred: impl Fn(&sony_usb::msc::SwitchError) -> bool,
+    ) -> bool {
+        failures.iter().all(pred)
     }
 
-    // ---- ② 打不开卷 / 发不出命令 → 权限或占用 ----
+    /// 有没有**任意一个**分区给了这个回复
+    fn any_says(
+        failures: &[sony_usb::msc::SwitchError],
+        pred: impl Fn(&sony_usb::msc::SwitchError) -> bool,
+    ) -> bool {
+        failures.iter().any(pred)
+    }
+
+    // ---- ① 打不开卷 / 发不出命令 → 权限或占用（它挡在前面，先说它）----
     if failures
         .iter()
         .any(|f| matches!(f, SwitchError::AccessDenied { .. }))
@@ -463,7 +458,7 @@ fn explain_switch_failure(failures: &[sony_usb::msc::SwitchError]) -> anyhow::Er
         );
     }
 
-    // ---- ③ 卡写了保护 ----
+    // ---- ② 卡写了保护 ----
     if failures.iter().any(|f| {
         matches!(
             f,
@@ -482,10 +477,59 @@ fn explain_switch_failure(failures: &[sony_usb::msc::SwitchError]) -> anyhow::Er
         );
     }
 
-    // ---- ④ 其它：如实转达相机的话，给一次拔插的机会 ----
+    // ---- ③ 有分区说没有介质 → 没插卡（`PMHOME` 是固定的 FAT 区，不会这么回）----
+    if any_says(failures, |f| {
+        matches!(
+            f,
+            SwitchError::Rejected {
+                rejection: Rejection::NoMedium,
+                ..
+            }
+        )
+    }) {
+        return anyhow::anyhow!(
+            "相机里没有可用的存储卡，所以没有能被切换的介质。\n\
+             海量存储器模式是把卡当成 U 盘用 —— 没插卡，相机也就不认这条命令。\n\
+             请把卡插好，拔插一次 USB 线，然后重试。\n\
+             \n\
+             各分区的回复：\n{}",
+            describe_failures(failures)
+        );
+    }
+
+    // ---- ④ 每个分区都说"没这个操作码" → 这条路对这台相机确实不通 ----
+    //
+    // 注意是 `all`：`PMHOME` 小分区回 05/20 是常态，不能拿它给整台相机定性。
+    if all_say(failures, |f| {
+        matches!(
+            f,
+            SwitchError::Rejected { rejection, .. } if rejection.means_unsupported()
+        )
+    }) {
+        return anyhow::anyhow!(
+            "相机没有接受「切到安装模式」这条命令：每个分区都回\n\
+             SCSI sense 05/20/00（INVALID COMMAND OPERATION CODE）—— 固件里没有这个操作码。\n\
+             \n\
+             这不是权限问题（那种情况会报「拒绝访问」），也不是分区选错，\n\
+             换线、拔插、以管理员身份重跑都不会改变固件的答复。\n\
+             \n\
+             如果这台相机本该能装应用（α6000 / α6300 / NEX-6 等），先排掉三件事：\n\
+             ① 相机里插着存储卡，并且卡没有写保护\n\
+             ② USB 连接方式是「海量存储器」，不是「电脑遥控」或「自动」\n\
+             ③ 换一个 USB 口，别用 USB 集线器\n\
+             然后拔插一次数据线重试。还是同一句的话，把下面「各分区的回复」发给作者。\n\
+             \n\
+             （NEX-7、NEX-5N、α7 III 这类机型本来就没有应用商店，遇到这句是正常的。）\n\
+             \n\
+             各分区的回复：\n{}",
+            describe_failures(failures)
+        );
+    }
+
+    // ---- ⑤ 其它：各分区说法不一，如实转达 ----
     anyhow::anyhow!(
-        "相机拒绝了「切到安装模式」的命令，没能进入安装模式。\n\
-         请把 USB 线拔下再插上，然后重试；仍然不行的话，把下面的内容发给作者。\n\
+        "相机没能切到「安装模式」：每个分区给的答复不一样，没有一条被接受。\n\
+         请把 USB 线拔下再插上，然后重试；仍然不行的话，把下面「各分区的回复」发给作者。\n\
          \n\
          各分区的回复：\n{}",
         describe_failures(failures)
@@ -688,12 +732,27 @@ pub fn find_and_prepare_camera(report: Reporter) -> Result<CameraStatus> {
              请把相机 USB 线拔下再插上，然后重试。"
         );
     }
+    // ⚠️ 这里**不能说**"这台相机不支持安装应用"。
+    //
+    // 真机教训：α6000 在 MTP 模式下对这条命令毫无反应，但它是完全支持装应用的
+    // （官方机型表 apps 2.4，社区还有人给它做 Doom）—— 它只认「海量存储器」
+    // 那条路。旧版在这里直接下"不支持"的结论，用户看到的就是
+    // "我的相机明明支持，你却说我没开 PMCA"。
+    //
+    // 所以这里只报现象，把可行的顺序摆出来：先拔插（最常见），再换海量存储器
+    // （老机型唯一的路），最后才是"可能真的不支持"。
     anyhow::bail!(
         "相机没有响应「切换到应用安装模式」的命令（等待 {} 秒）。\n\
-         这通常说明**这台相机不支持安装应用**。\n\
          相机型号：{}\n\
-         能装应用的机型需要支持 PlayMemories Camera Apps。\n\
-         如果你的相机确实支持，请把 USB 线拔下再插上后重试。",
+         \n\
+         按这个顺序试，前两条通常就够了：\n\
+         ① 把 USB 线拔下再插上，重新安装 —— 相机刚复位时常会不理这条命令\n\
+         ② 相机的 USB 连接方式改成「海量存储器」，再拔插一次\n\
+            （α6000、NEX-6 这类机型只认那条路，在 MTP 下等多久都不会切）\n\
+         ③ 换一个 USB 口，别用 USB 集线器\n\
+         \n\
+         三步都不行，才需要怀疑「这台相机确实不支持安装应用」——\n\
+         那通常是索尼把系统从 Android 换成 Linux 的机型（例如 α7 III）。",
         MODE_SWITCH_TIMEOUT.as_secs(),
         info.model
     )
@@ -949,38 +1008,68 @@ mod tests {
         assert!(s.mode_text().contains("普通模式"));
     }
 
-    /// NEX-7 真机：两个分区都回 `05/20/00`（固件里没有这条命令）
-    ///
-    /// 这种情况必须说"机型不支持"，**不能**再说"换个分区试试"或
-    /// "以管理员身份重跑" —— 那两条路对用户是纯消耗。
-    #[test]
-    fn unsupported_firmware_is_reported_as_unsupported_not_as_permissions() {
+    /// 造一条"相机拒绝"的失败记录
+    fn rejected(volume: &str, key: u8, asc: u8) -> sony_usb::msc::SwitchError {
         use sony_usb::msc::{Rejection, SwitchError};
-        let rejected = |volume: &str| SwitchError::Rejected {
+        SwitchError::Rejected {
             volume: volume.into(),
             scsi_status: 0x02,
-            key: 0x05,
-            asc: 0x20,
+            key,
+            asc,
             ascq: 0x00,
-            rejection: Rejection::NoSuchCommand,
-        };
-        let msg = explain_switch_failure(&[rejected("\\\\.\\F:"), rejected("\\\\.\\G:")])
-            .to_string();
+            rejection: Rejection::classify((key, asc, 0)),
+        }
+    }
+
+    /// NEX-7 真机：两个分区都回 `05/20/00`（固件里没有这条命令）
+    ///
+    /// 这种情况才可以说"这条路走不通"，而且**不能**再劝人"换个分区试试"或
+    /// "以管理员身份重跑" —— 那两条路对用户是纯消耗。
+    #[test]
+    fn every_partition_answering_invalid_opcode_is_reported_as_unsupported() {
+        let msg = explain_switch_failure(&[
+            rejected("\\\\.\\F:", 0x05, 0x20),
+            rejected("\\\\.\\G:", 0x05, 0x20),
+        ])
+        .to_string();
 
         assert!(msg.contains("05/20/00"), "要把相机的原话摆出来：{msg}");
-        assert!(msg.contains("固件"), "要说清是固件里没有这条命令：{msg}");
-        assert!(msg.contains("PlayMemories"), "要说明支持条件：{msg}");
+        assert!(msg.contains("固件"), "要说清是固件里没有这个命令：{msg}");
         assert!(
             !msg.contains("试试另一个"),
             "两个分区回的是同一句，别让人白折腾：{msg}"
         );
-        assert!(
-            !msg.contains("请以管理员身份"),
-            "这不是权限问题：{msg}"
-        );
+        assert!(!msg.contains("请以管理员身份"), "这不是权限问题：{msg}");
         // 第一行要能单独当标题用（界面上只显示第一行）
         let first = msg.lines().next().unwrap();
-        assert!(first.contains("这台相机"), "第一行要能独立成句：{first}");
+        assert!(first.contains("相机没有接受"), "第一行要能独立成句：{first}");
+    }
+
+    /// ⚠️ 回归测试：α6000 就是被这里坑过的。
+    ///
+    /// `PMHOME` 小分区回 `05/20`（它本来就不认这条命令，α6300 实测也是拒绝），
+    /// 卡分区回的是别的原因 —— 这种"说法不一"绝对不能给整台相机定性成
+    /// "你的相机需要支持 PMCA"。α6000 明明支持（官方机型表 apps 2.4）。
+    #[test]
+    fn one_partition_answering_invalid_opcode_does_not_condemn_the_model() {
+        let msg = explain_switch_failure(&[
+            rejected("\\\\.\\F:", 0x05, 0x20), // PMHOME 那种小分区
+            rejected("\\\\.\\G:", 0x02, 0x3A), // 卡分区：没有介质
+        ])
+        .to_string();
+
+        assert!(
+            !msg.contains("固件里没有这个操作码"),
+            "只有一个分区这么说，不能给机型定性：{msg}"
+        );
+        assert!(
+            !msg.contains("PlayMemories"),
+            "更不该让用户去怀疑自己的相机不支持：{msg}"
+        );
+        assert!(
+            msg.contains("存储卡"),
+            "卡分区说没有介质，就该提示插卡：{msg}"
+        );
     }
 
     /// 打不开卷 = 权限/占用，和相机无关
@@ -998,16 +1087,7 @@ mod tests {
     /// 卡写了保护是第三种情况，别混进"不支持"
     #[test]
     fn write_protected_card_gets_its_own_advice() {
-        use sony_usb::msc::{Rejection, SwitchError};
-        let msg = explain_switch_failure(&[SwitchError::Rejected {
-            volume: "\\\\.\\F:".into(),
-            scsi_status: 0x02,
-            key: 0x07,
-            asc: 0x27,
-            ascq: 0x00,
-            rejection: Rejection::WriteProtected,
-        }])
-        .to_string();
+        let msg = explain_switch_failure(&[rejected("\\\\.\\F:", 0x07, 0x27)]).to_string();
         assert!(msg.contains("LOCK"), "要指到卡上的锁：{msg}");
         assert!(!msg.contains("不支持"), "写保护不是机型不支持：{msg}");
     }
